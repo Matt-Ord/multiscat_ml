@@ -4,7 +4,12 @@ version = "0.0.1"
 description = "An example Python Package"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
-dependencies = []
+dependencies = [
+    "h5py>=3.16.0",
+    "matplotlib>=3.10.8",
+    "multiscat",
+    "torch>=2.11.0",
+]
 
 [dependency-groups]
 dev = [
@@ -71,6 +76,13 @@ typeCheckingMode = "strict"
 include = ["tests", "my_project", "examples"]
 reportImplicitOverride = true
 reportUnknownMemberType = false
+
+[tool.setuptools.packages.find]
+include = ["my_project", "my_project.*"]
+
+[tool.uv.sources]
+multiscat = { git = "https://github.com/Matt-Ord/multiscat.git" }
+
 
 [build-system]
 requires = ["setuptools"]
