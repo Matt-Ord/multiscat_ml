@@ -1,7 +1,7 @@
 def test_import() -> None:
     try:
-        import my_project  # noqa: PLC0415
+        import multiscat_ml  # noqa: PLC0415
     except ImportError:
-        my_project = None  # ty:ignore[invalid-assignment]
+        multiscat_ml = None  # ty:ignore[invalid-assignment]
 
-    assert my_project is not None, "my_project module should not be None"
+    assert multiscat_ml is not None, "multiscat_ml module should not be None"
