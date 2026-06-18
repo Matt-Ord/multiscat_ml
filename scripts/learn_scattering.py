@@ -297,7 +297,7 @@ class HDF5ScatteringDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         return self.length
 
     @override
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:  # ty:ignore[invalid-method-override]
         # Lazy initialization of the HDF5 file handler.
         # This is best practice to avoid errors if using multiple DataLoader workers.
         if self.file is None:
@@ -404,12 +404,6 @@ class SparseScatteringLoss(nn.Module):
         peak_weight: float = 10.0,
         sparsity_weight: float = 1e-4,
     ) -> None:
-        """
-        Args:
-            peak_weight: How much extra to penalize errors on true diffraction peaks.
-            sparsity_weight: The strength of the L1 penalty pushing empty space to zero.
-
-        """
         super().__init__()
         self.peak_weight = peak_weight
         self.sparsity_weight = sparsity_weight
@@ -435,7 +429,7 @@ class SparseScatteringLoss(nn.Module):
         return weighted_mse + (self.sparsity_weight * sparsity_loss)
 
 
-def train() -> None:
+def train() -> None:  # noqa: PLR0914, PLR0915
     dataset = load_datasets()
     train_dataset, val_dataset = random_split(dataset, [0.8, 0.2])
 

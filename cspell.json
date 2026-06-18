@@ -19,7 +19,8 @@
         "pyproject",
         "scipy",
         "trange",
-        "tqdm"
+        "tqdm",
+        "GELU"
     ],
     "flagWords": [
         "hte",
