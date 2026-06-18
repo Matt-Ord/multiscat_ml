@@ -1,6 +1,6 @@
-# Project Template
+# Multiscat ML
 
-View the `phonon_lifetime` package documentation [here](https://matt-ord.github.io/phonon_lifetime/).
+View the `multiscat_ml` package documentation [here](https://matt-ord.github.io/multiscat_ml/).
 
 ## Setup
 
