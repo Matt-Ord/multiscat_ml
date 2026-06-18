@@ -1,7 +1,7 @@
 [project]
-name = "my_project"
+name = "multiscat_ml"
 version = "0.0.1"
-description = "An example Python Package"
+description = "Machine learning to solve the scattering problem."
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
@@ -73,12 +73,12 @@ testpaths = ["tests"]
 
 [tool.pyright]
 typeCheckingMode = "strict"
-include = ["tests", "my_project", "examples"]
+include = ["tests", "multiscat_ml", "examples"]
 reportImplicitOverride = true
 reportUnknownMemberType = false
 
 [tool.setuptools.packages.find]
-include = ["my_project", "my_project.*"]
+include = ["multiscat_ml", "multiscat_ml.*"]
 
 [tool.uv.sources]
 multiscat = { git = "https://github.com/Matt-Ord/multiscat.git" }

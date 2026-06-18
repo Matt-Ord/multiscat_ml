@@ -449,7 +449,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "my-project"
+name = "multiscat-ml"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [
