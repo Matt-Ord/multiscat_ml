@@ -1,6 +1,6 @@
 import contextlib
 from pathlib import Path
-from typing import Any, override
+from typing import Any, cast, override
 
 import h5py  # type: ignore[import-untyped]
 import numpy as np
@@ -12,7 +12,14 @@ from multiscat.basis import (
     split_scattering_metadata,
 )
 from multiscat.config import MorseScatteringCondition, momentum_from_angles
-from multiscat.multiscat import get_scattering_matrix_from_state, get_scattering_state
+from multiscat.multiscat import (
+    _as_natural_units,
+    get_preconditioned_state_from_state,
+    get_scattering_state,
+)
+from multiscat.multiscat._scipy import (
+    _build_scipy_operators,
+)
 from scipy.constants import angstrom as angstrom_si  # type: ignore[import-untyped]
 from scipy.constants import (  # type: ignore[import-untyped]
     atomic_mass,
@@ -180,6 +187,69 @@ def simulate_state(
     return np.array([data.real, data.imag])
 
 
+def simulate_uppered_state(
+    params: np.ndarray[tuple[int], np.dtype[np.float64]],
+) -> np.ndarray[tuple[int, int], np.dtype[np.float64]]:
+    """Simulate the uppered state from the given parameters."""
+    condition = condition_from_params(params)
+    config = OptimizationConfig(precision=1e-5, max_iterations=1000, n_channels=250)
+    converted_condition = _as_natural_units(condition)
+
+    # Get the scattering state
+    state = get_scattering_state(condition, config)
+
+    # Get the preconditioned state
+    preconditioned_state = get_preconditioned_state_from_state(
+        state, condition, n_channels=config.n_channels
+    )
+
+    # Build the scipy operators
+    _, _, upper = _build_scipy_operators(
+        converted_condition, n_channels=config.n_channels
+    )
+
+    # Apply the upper operator to get the uppered state
+    uppered_solution = upper.matvec(
+        preconditioned_state.with_basis(
+            close_coupling_basis(condition.metadata)
+        ).raw_data
+    ).reshape(condition.metadata.shape)
+
+    # Convert the solution back to a State object
+    uppered_state = State(
+        close_coupling_basis(condition.metadata).upcast(),
+        cast("np.ndarray[tuple[int], np.dtype[np.complex128]]", uppered_solution),
+    )
+
+    # Return the real and imaginary parts of the uppered state
+    uppered_data = uppered_state.with_basis(
+        close_coupling_basis(condition.metadata)
+    ).raw_data.reshape(condition.metadata.shape)
+    return np.array([uppered_data.real, uppered_data.imag])
+
+
+def simulate_preconditioned_state(
+    params: np.ndarray[tuple[int], np.dtype[np.float64]],
+) -> np.ndarray[tuple[int, int], np.dtype[np.float64]]:
+    """Simulate the preconditioned state from the given parameters."""
+    condition = condition_from_params(params)
+    config = OptimizationConfig(precision=1e-5, max_iterations=1000, n_channels=250)
+
+    # Get the scattering state
+    state = get_scattering_state(condition, config)
+
+    # Get the preconditioned state
+    preconditioned_state = get_preconditioned_state_from_state(
+        state, condition, n_channels=config.n_channels
+    )
+
+    # Return the real and imaginary parts of the preconditioned state
+    preconditioned_data = preconditioned_state.with_basis(
+        close_coupling_basis(condition.metadata)
+    ).raw_data.reshape(condition.metadata.shape)
+    return np.array([preconditioned_data.real, preconditioned_data.imag])
+
+
 def intensity_map_from_actual(
     actual: (Array[Any, np.dtype[np.complex128]]),
     *,
@@ -223,7 +293,7 @@ def format_intensity_map(
 
 
 def generate_dataset_hdf5(filepath: Path, num_samples: int = 50) -> None:
-    """Generate parameters and S-matrices, saving them directly to disk."""
+    """Generate parameters and Uppered state, saving them directly to disk."""
     filepath.parent.mkdir(parents=True, exist_ok=True)
     if filepath.exists():
         print(f"Dataset already exists at {filepath}. Skipping generation.")
@@ -251,7 +321,7 @@ def generate_dataset_hdf5(filepath: Path, num_samples: int = 50) -> None:
                     Nx, Ny, Nz = map(int, np.round(physical_params[-3:]))
                     physical_params[-3:] = [Nx, Ny, Nz]
                     x = normalize_params(physical_params)
-                    y = simulate_state(x)
+                    y = simulate_uppered_state(x)
 
                     x_ds[i] = x
                     y_group.create_dataset(str(i), data=y, dtype=np.float64)
@@ -314,14 +384,15 @@ def freeze_parameters(model: nn.Module) -> Any:  # noqa: ANN401
 
 
 def generate() -> None:
-    for i in range(20, 70):
-        data_path = Path(f"data/15/state_data_{i}/.hdf5")
+    for i in range(100):
+        data_path = Path(f"data/15/preconditioned_state_data_{i}/.hdf5")
         generate_dataset_hdf5(data_path, num_samples=50)
 
 
 def load_datasets() -> ConcatDataset[tuple[torch.Tensor, torch.Tensor]]:
     datasets = [
-        HDF5ScatteringDataset(Path(f"data/15/state_data_{i}/.hdf5")) for i in range(70)
+        HDF5ScatteringDataset(Path(f"data/15/preconditioned_state_data_{i}/.hdf5"))
+        for i in range(10)
     ]
     return ConcatDataset[tuple[torch.Tensor, torch.Tensor]](datasets)
 
@@ -346,8 +417,37 @@ class ResBlock(nn.Module):
         return self.act(x + self.net(x))
 
 
+class SirenLayer(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        is_first=False,
+        omega_0=30.0,
+    ) -> None:
+        super().__init__()
+
+        self.linear = nn.Linear(in_features, out_features)
+        self.omega_0 = omega_0
+        self.is_first = is_first
+
+        self.init_weights()
+
+    def init_weights(self) -> None:
+        with torch.no_grad():
+            if self.is_first:
+                bound = 1 / self.linear.in_features
+            else:
+                bound = np.sqrt(6 / self.linear.in_features) / self.omega_0
+
+            self.linear.weight.uniform_(-bound, bound)
+
+    def forward(self, x):
+        return torch.sin(self.omega_0 * self.linear(x))
+
+
 class ForwardStateModel(nn.Module):
-    """Predicts state from 15 parameters using a deep ResNet at each grid."""
+    """Predicts uppered state from 15 parameters using a deep ResNet at each grid."""
 
     def __init__(
         self,
@@ -357,7 +457,7 @@ class ForwardStateModel(nn.Module):
     ) -> None:
         super().__init__()
 
-        # 1. Expand the 6 parameters into a high-dimensional space
+        # 1. Expand the 15 parameters into a high-dimensional space
         self.embedding = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -376,7 +476,6 @@ class ForwardStateModel(nn.Module):
         # 3. Collapse back down to the real and the imaginary parts of the 225 (15x15) chi-matrix
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, output_dim),
-            nn.LeakyReLU(negative_slope=0.01),
         )
 
     @override
@@ -414,6 +513,56 @@ class BackwardStateModel(nn.Module):
         return self.net(x)  # (B, 15)
 
 
+class SparseScatteringLoss(nn.Module):
+    def __init__(
+        self,
+        peak_weight: float = 10.0,
+        sparsity_weight: float = 1e-4,
+    ) -> None:
+        super().__init__()
+        self.peak_weight = peak_weight
+        self.sparsity_weight = sparsity_weight
+        self.mse = nn.MSELoss(reduction="none")  # Notice reduction='none'
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        # 1. Calculate the raw, un-averaged pixel-wise squared error
+        base_error = self.mse(y_pred, y_true)
+
+        # 2. Intensity Weighting
+        # Create a mask where empty channels equal 1.0, and bright channels > 1.0
+        # Example: If a peak has intensity 0.1 and weight is 100, its multiplier becomes 11.0
+        weight_mask = 1.0 + (self.peak_weight * torch.abs(y_true))
+
+        # Apply the weight and take the mean
+        weighted_mse = torch.mean(base_error * weight_mask)
+
+        # 3. Sparsity Penalty (L1)
+        # This constantly applies a tiny downward pressure on all predicted values,
+        # forcing the network to snap the background noise to exactly 0.0
+        sparsity_loss = torch.mean(torch.abs(y_pred))
+
+        return weighted_mse + (self.sparsity_weight * sparsity_loss)
+
+
+def _make_coords(
+    Nx: int,
+    Ny: int,
+    Nz: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    xs = torch.linspace(-1, 1, Nx, device=device, dtype=dtype)
+    ys = torch.linspace(-1, 1, Ny, device=device, dtype=dtype)
+    zs = torch.linspace(-1, 1, Nz, device=device, dtype=dtype)
+
+    grid = torch.stack(
+        torch.meshgrid(xs, ys, zs, indexing="ij"),
+        dim=-1,
+    )  # (Nx, Ny, Nz, 3)
+
+    return grid.reshape(-1, 3)  # (N, 3)
+
+
 def predict_chi_batch_from_params(
     forward_model: nn.Module,
     params_batch: torch.Tensor,
@@ -430,32 +579,48 @@ def predict_chi_batch_from_params(
     -------
         chi_pred_batch shape = (B, 2, Nx, Ny, Nz)
     """
-    device = params_batch.device
-    chi_pred_batch: list[torch.Tensor] = []
+    if len(chi_batch) == 0:
+        return []
 
+    device = params_batch.device
+    dtype = params_batch.dtype
+    out: list[torch.Tensor] = []
+
+    # Fast path: all volumes have the same spatial shape.
+    shapes = [(chi.shape[1], chi.shape[2], chi.shape[3]) for chi in chi_batch]
+    if len(set(shapes)) == 1:
+        Nx, Ny, Nz = shapes[0]
+        coords = _make_coords(Nx, Ny, Nz, device=device, dtype=dtype)
+        n_pts = coords.shape[0]
+
+        # Build one big input tensor: (B * n_pts, 15)
+        prefix = params_batch[:, :-3].unsqueeze(1).expand(-1, n_pts, -1)
+        coords_rep = coords.unsqueeze(0).expand(params_batch.size(0), -1, -1)
+
+        model_in = torch.cat(
+            [prefix.reshape(-1, params_batch.shape[-1] - 3), coords_rep.reshape(-1, 3)],
+            dim=-1,
+        )
+
+        pred = forward_model(model_in)  # (B * n_pts, 2)
+        pred = pred.view(params_batch.size(0), n_pts, 2).transpose(1, 2).contiguous()
+
+        return [pred[i].view(2, Nx, Ny, Nz) for i in range(pred.size(0))]
+
+    # Fallback: different spatial shapes, still avoid per-point loops.
     for ind, chi in enumerate(chi_batch):
         _, Nx, Ny, Nz = chi.shape
+        coords = _make_coords(Nx, Ny, Nz, device=device, dtype=dtype)
 
-        xs = torch.linspace(0, 1, Nx, device=device)
-        ys = torch.linspace(0, 1, Ny, device=device)
-        zs = torch.linspace(0, 1, Nz, device=device)
+        n_pts = coords.shape[0]
+        prefix = params_batch[ind, :-3].expand(n_pts, -1)
+        model_in = torch.cat([prefix, coords], dim=-1)  # (n_pts, 15)
 
-        grid = torch.stack(
-            torch.meshgrid(xs, ys, zs, indexing="ij"),
-            dim=-1,
-        )  # (Nx, Ny, Nz, 3)
-
-        coords = grid.reshape(-1, 3)  # (Nx*Ny*Nz, 3)
-
-        params = params_batch[ind].unsqueeze(0).repeat(coords.size(0), 1).clone()
-        params[:, -3:] = coords
-
-        pred = forward_model(params)  # (Nx*Ny*Nz, 2)
-
+        pred = forward_model(model_in)  # (n_pts, 2)
         pred = pred.view(Nx, Ny, Nz, 2).permute(3, 0, 1, 2).contiguous()
-        chi_pred_batch.append(pred)
+        out.append(pred)
 
-    return chi_pred_batch
+    return out
 
 
 def train() -> None:  # noqa: PLR0914, PLR0915
@@ -491,7 +656,7 @@ def train() -> None:  # noqa: PLR0914, PLR0915
 
     # backward_criterion = nn.MSELoss()
     # maybe use TotalScatteringLoss(lambda_physics=0.01)
-    forward_criterion = nn.MSELoss()
+    forward_criterion = SparseScatteringLoss(peak_weight=10.0, sparsity_weight=1e-5)
     forward_optimizer = optim.AdamW(
         forward_model.parameters(),
         lr=1e-3,
@@ -519,16 +684,16 @@ def train() -> None:  # noqa: PLR0914, PLR0915
     # )
 
     best_val_loss_f = float("inf")
-    patience = 15
+    patience = 20
     epochs_without_improvement = 0
-    epochs = 100
+    epochs = 150
     print(
         f"Training on {len(train_dataset)} samples,"
         f"Validating on {len(val_dataset)} samples...",
     )
     print(f"Using device: {DEVICE}")
 
-    def mse_loss_for_tensor_lists(
+    def loss_for_tensor_lists(
         preds: list[torch.Tensor],
         targets: list[torch.Tensor],
         criterion: nn.Module | None = None,
@@ -548,6 +713,70 @@ def train() -> None:  # noqa: PLR0914, PLR0915
 
         return loss / len(preds)
 
+    def loss_for_Uppered_tensor_lists(
+        preds: list[torch.Tensor],
+        targets: list[torch.Tensor],
+        params,
+        criterion: nn.Module | None = None,
+    ) -> torch.Tensor:
+
+        if len(preds) != len(targets):
+            msg = f"Length mismatch: {len(preds)} preds vs {len(targets)} targets"
+            raise ValueError(msg)
+
+        if criterion is None:
+            criterion = nn.MSELoss()
+
+        config = OptimizationConfig(precision=1e-5, max_iterations=1000, n_channels=250)
+
+        loss = torch.zeros((), device=preds[0].device, dtype=preds[0].dtype)
+
+        def get_uppered_state_from_lowered_state_data(data, param):
+            actual_condition = condition_from_params(param.detach().cpu().numpy())
+            converted_condition = _as_natural_units(actual_condition)
+            stat_data = data[0] + 1j * data[1]
+
+            _, _lower, upper = _build_scipy_operators(
+                converted_condition, n_channels=config.n_channels
+            )
+
+            # Convert the data to a State object
+            state = State(
+                close_coupling_basis(converted_condition.metadata).upcast(),
+                stat_data.detach().cpu().numpy(),
+            )
+
+            # Apply the upper operator to get the uppered state
+            Uppered_solution = upper.matvec(
+                get_preconditioned_state_from_state(
+                    state, actual_condition, n_channels=config.n_channels
+                )
+                .with_basis(close_coupling_basis(actual_condition.metadata))
+                .raw_data
+            ).reshape(actual_condition.metadata.shape)
+
+            Uppered_state = State(
+                close_coupling_basis(actual_condition.metadata).upcast(),
+                cast(
+                    "np.ndarray[tuple[int], np.dtype[np.complex128]]", Uppered_solution
+                ),
+            )
+
+            Uppered_data = Uppered_state.with_basis(
+                close_coupling_basis(actual_condition.metadata)
+            ).raw_data.reshape(actual_condition.metadata.shape)
+
+            return torch.from_numpy(
+                np.array([Uppered_data.real, Uppered_data.imag])
+            ).to(device=preds[0].device, dtype=preds[0].dtype)
+
+        for param, pred, target in zip(params, preds, targets, strict=True):
+            Uppered_pred = get_uppered_state_from_lowered_state_data(pred, param)
+            Uppered_target = get_uppered_state_from_lowered_state_data(target, param)
+            loss += criterion(Uppered_pred, Uppered_target)
+
+        return loss / len(preds)
+
     for epoch in range(epochs):
         forward_model.train()
 
@@ -560,9 +789,7 @@ def train() -> None:  # noqa: PLR0914, PLR0915
             chi_pred_batch = predict_chi_batch_from_params(
                 forward_model, params_batch, chi_batch
             )
-            loss_f = mse_loss_for_tensor_lists(
-                chi_pred_batch, chi_batch, forward_criterion
-            )
+            loss_f = loss_for_tensor_lists(chi_pred_batch, chi_batch, forward_criterion)
             loss_f.backward()
             forward_optimizer.step()
 
@@ -593,7 +820,7 @@ def train() -> None:  # noqa: PLR0914, PLR0915
                 chi_pred_batch = predict_chi_batch_from_params(
                     forward_model, params_batch, chi_batch
                 )
-                val_loss_f += mse_loss_for_tensor_lists(
+                val_loss_f += loss_for_tensor_lists(
                     chi_pred_batch, chi_batch, forward_criterion
                 ).item()
 
@@ -621,7 +848,7 @@ def train() -> None:  # noqa: PLR0914, PLR0915
 
         print(
             f"Epoch {epoch + 1:03d}/{epochs} | "
-            f"Fwd Loss (Tr/Val): {average_train_loss_f:.1e} / {average_val_loss_f:.1e}"
+            f"Fwd Loss (Tr/Val): {average_train_loss_f:.2e} / {average_val_loss_f:.2e}"
             f"[LR: {lr_f:.1e}] | "
         )
 
@@ -675,7 +902,7 @@ def test() -> None:
     condition = condition_from_params(test_params)
     forward_model = ForwardStateModel().to(DEVICE)
     forward_model.load_state_dict(
-        torch.load("data/15/chi_forward_model.pth", map_location=DEVICE),
+        torch.load("data/15/best_chi_forward_model.pth", map_location=DEVICE),
     )
     forward_model.eval()
 
@@ -686,50 +913,46 @@ def test() -> None:
             [torch.empty((2, *condition.metadata.shape), device=DEVICE)],
         )
         stat_data = channel_amp_dense_list[0][0] + 1j * channel_amp_dense_list[0][1]
-        state = State(
+        preconditioned_pred_state = State(
             close_coupling_basis(condition.metadata).upcast(),
             stat_data.detach().cpu().numpy(),
         )
-        pred_s_matrix = get_scattering_matrix_from_state(
-            state, condition, n_channels=config.n_channels
-        )
-
-    fig, ax, _mesh = plot.array_against_axes_2d_k_nearest_neighbor(
-        pred_s_matrix, measure="abs"
-    )
-    ax.set_title("Predicted scattering matrix")
-    fig.savefig("data/15/scattering_matrix_from_predicted_state.png")
 
     actual = get_scattering_state(
         condition,
         config,
     )
 
-    actual_s_matrix = get_scattering_matrix_from_state(
+    preconditioned_state = get_preconditioned_state_from_state(
         actual, condition, n_channels=config.n_channels
     )
 
-    fig, ax, _mesh = plot.array_against_axes_2d_k_nearest_neighbor(
-        actual_s_matrix - pred_s_matrix, measure="abs"
-    )
-    fig.savefig("data/15/error_scattering_matrix_from_state.png")
+    # Return the real and imaginary parts of the preconditioned state
+    preconditioned_actual_psi = preconditioned_state.with_basis(
+        close_coupling_basis(condition.metadata)
+    ).raw_data.reshape(condition.metadata.shape)[2, 3, :]
 
-    print(format_intensity_map(pred_s_matrix, threshold=1e-6))
-    print("error intensity map:")
-    print(format_intensity_map(actual_s_matrix - pred_s_matrix, threshold=1e-6))
-    error = actual_s_matrix - pred_s_matrix
-    print(np.sum(np.abs(error.raw_data)))
+    precondtioned_pred_psi = preconditioned_pred_state.with_basis(
+        close_coupling_basis(condition.metadata)
+    ).raw_data.reshape(condition.metadata.shape)[2, 3, :]
 
-    fig, ax, _mesh = plot.array_against_axes_2d_k_nearest_neighbor(
-        actual_s_matrix, measure="abs"
-    )
-    ax.set_title("The actual scattering matrix")
-    fig.savefig("data/15/scattering_matrix_from_actual_state.png")
+    _, metadata_z = split_scattering_metadata(condition.metadata)
+    height = metadata_z.domain.delta
+    nz = condition.metadata.shape[2]
+    z = np.linspace(0, height, nz)
+    fig, ax1 = plot.get_figure()
+    ax1.set_xlabel("z")
+    ax1.set_ylabel(r"$\psi_{00}(z)$")
+    ax1.plot(z[:100], preconditioned_actual_psi.real[:100], label="Actual real part")
+    ax1.plot(z[:100], precondtioned_pred_psi.real[:100], label="Predicted real part")
+    ax1.set_title("Actual and predicted scattering state")
+    ax1.legend()
+    fig.savefig("data/15/scattering_state.png")
 
 
 if __name__ == "__main__":
-    RUN_GENERATE = True
-    RUN_TRAIN = True
+    RUN_GENERATE = False
+    RUN_TRAIN = False
     RUN_TEST = True
 
     if RUN_GENERATE:

@@ -658,7 +658,9 @@ def test() -> None:
             AsUpcast(basis.transformed_from_metadata(metadata_x01), metadata_x01),
             channel_intensity_dense.detach().cpu().numpy().astype(np.complex128),
         )
-    fig, ax, _mesh = plot.array_against_axes_2d_k(predicted, measure="abs")
+    fig, ax, _mesh = plot.array_against_axes_2d_k_nearest_neighbor(
+        predicted, measure="abs"
+    )
     ax.set_title("Predicted scattering matrix")
     fig.savefig("data/15/predicted_scattering_matrix.png")
 
@@ -668,7 +670,9 @@ def test() -> None:
         backend="scipy",
     )
 
-    fig, ax, _mesh = plot.array_against_axes_2d_k(actual - predicted, measure="abs")
+    fig, ax, _mesh = plot.array_against_axes_2d_k_nearest_neighbor(
+        actual - predicted, measure="abs"
+    )
     fig.savefig("data/15/error_scattering_matrix.png")
 
     print(format_intensity_map(predicted, threshold=1e-6))
@@ -677,7 +681,9 @@ def test() -> None:
     error = actual - predicted
     print(np.sum(np.abs(error.raw_data)))
 
-    fig, ax, _mesh = plot.array_against_axes_2d_k(actual, measure="abs")
+    fig, ax, _mesh = plot.array_against_axes_2d_k_nearest_neighbor(
+        actual, measure="abs"
+    )
     ax.set_title("The actual scattering matrix")
     fig.savefig("data/15/actual_scattering_matrix.png")
 
