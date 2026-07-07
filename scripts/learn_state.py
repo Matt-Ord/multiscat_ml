@@ -1072,7 +1072,7 @@ def test() -> None:
 
 if __name__ == "__main__":
     RUN_GENERATE = False
-    RUN_TRAIN = False
+    RUN_TRAIN = True
     RUN_TEST = True
 
     if RUN_GENERATE:
