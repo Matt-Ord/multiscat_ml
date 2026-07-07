@@ -1,4 +1,5 @@
 import contextlib
+import time
 from pathlib import Path
 from typing import Any, cast, override
 
@@ -30,11 +31,13 @@ from slate_core import Array, metadata, plot
 from slate_quantum import State, operator
 from torch import nn, optim
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
+from tqdm import tqdm
 
 # Constants
 HELIUM_MASS = physical_constants["alpha particle mass"][0]
 HELIUM_ENERGY = 20 * electron_volt * 10**-3
 Z_HEIGHT = 8
+Nx, Ny, Nz = 15, 15, 200
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -48,7 +51,7 @@ PARAMS_MIN = np.array(
     dtype=np.float64,
 )
 PARAMS_MAX = np.array(
-    [10.0, 1.5, 4.0, 0.20, 6, 6, 6, 16, np.pi / 2, 2 * np.pi, 40, 10, 15, 15, 150],
+    [10.0, 1.5, 4.0, 0.20, 6, 6, 6, 16, np.pi / 2, 2 * np.pi, 40, 10, Nx, Ny, Nz],
     dtype=np.float64,
 )
 
@@ -230,7 +233,7 @@ def simulate_uppered_state(
 
 def simulate_preconditioned_state(
     params: np.ndarray[tuple[int], np.dtype[np.float64]],
-) -> np.ndarray[tuple[int, int], np.dtype[np.float64]]:
+):
     """Simulate the preconditioned state from the given parameters."""
     condition = condition_from_params(params)
     config = OptimizationConfig(precision=1e-5, max_iterations=1000, n_channels=250)
@@ -247,7 +250,9 @@ def simulate_preconditioned_state(
     preconditioned_data = preconditioned_state.with_basis(
         close_coupling_basis(condition.metadata)
     ).raw_data.reshape(condition.metadata.shape)
-    return np.array([preconditioned_data.real, preconditioned_data.imag])
+    return torch.from_numpy(
+        np.stack((preconditioned_data.real, preconditioned_data.imag), axis=0)
+    ).float()
 
 
 def intensity_map_from_actual(
@@ -293,7 +298,7 @@ def format_intensity_map(
 
 
 def generate_dataset_hdf5(filepath: Path, num_samples: int = 50) -> None:
-    """Generate parameters and Uppered state, saving them directly to disk."""
+    """Generate parameters and Preconditioned state, saving them directly to disk."""
     filepath.parent.mkdir(parents=True, exist_ok=True)
     if filepath.exists():
         print(f"Dataset already exists at {filepath}. Skipping generation.")
@@ -310,21 +315,18 @@ def generate_dataset_hdf5(filepath: Path, num_samples: int = 50) -> None:
         x_ds = f.create_dataset("X", shape=(num_samples, 15), dtype=np.float64)
 
         # Variable-size outputs go in a group
-        y_group = f.create_group("Y")
+        y_ds = f.create_dataset(
+            "Y", shape=(num_samples, 2, Nx, Ny, Nz), dtype=np.float64
+        )
         for i in range(num_samples):
             while True:
                 try:
                     print(f"Generating sample {i + 1}/{num_samples}")
 
                     params = rng.uniform(size=15)
-                    physical_params = denormalize_params(params)
-                    Nx, Ny, Nz = map(int, np.round(physical_params[-3:]))
-                    physical_params[-3:] = [Nx, Ny, Nz]
-                    x = normalize_params(physical_params)
-                    y = simulate_uppered_state(x)
-
-                    x_ds[i] = x
-                    y_group.create_dataset(str(i), data=y, dtype=np.float64)
+                    params[-3:] = 1
+                    x_ds[i] = params
+                    y_ds[i] = simulate_preconditioned_state(params)
 
                     break  # success
 
@@ -357,7 +359,7 @@ class HDF5ScatteringDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
             self.file = h5py.File(self.filepath, "r")
 
         x_tensor = torch.from_numpy(self.file["X"][idx]).float()
-        y_tensor = torch.from_numpy(self.file["Y"][str(idx)][()]).float()
+        y_tensor = torch.from_numpy(self.file["Y"][idx]).float()
         return x_tensor, y_tensor
 
     def __del__(self) -> None:
@@ -384,15 +386,15 @@ def freeze_parameters(model: nn.Module) -> Any:  # noqa: ANN401
 
 
 def generate() -> None:
-    for i in range(100):
-        data_path = Path(f"data/15/preconditioned_state_data_{i}/.hdf5")
+    for i in range(10):
+        data_path = Path(f"data/15/preconditioned_state_data_{i}.hdf5")
         generate_dataset_hdf5(data_path, num_samples=50)
 
 
 def load_datasets() -> ConcatDataset[tuple[torch.Tensor, torch.Tensor]]:
     datasets = [
-        HDF5ScatteringDataset(Path(f"data/15/preconditioned_state_data_{i}/.hdf5"))
-        for i in range(10)
+        HDF5ScatteringDataset(Path(f"data/15/preconditioned_state_data_{i}.hdf5"))
+        for i in range(5)
     ]
     return ConcatDataset[tuple[torch.Tensor, torch.Tensor]](datasets)
 
@@ -446,14 +448,147 @@ class SirenLayer(nn.Module):
         return torch.sin(self.omega_0 * self.linear(x))
 
 
+class ConditionEncoder(nn.Module):
+    """Encodes physical setup parameters into a latent conditioning vector."""
+
+    def __init__(
+        self,
+        param_dim: int,
+        cond_dim: int = 64,
+    ) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(param_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, 128),
+            nn.GELU(),
+            nn.Linear(128, cond_dim),
+        )
+
+    @override
+    def forward(self, params: torch.Tensor) -> torch.Tensor:
+        return self.net(params)
+
+
+class FiLMSineLayer(nn.Module):
+    """
+    SIREN layer modulated by a conditioning vector.
+    h = sin(omega_0 * ((Wx + b) * (1 + gamma(cond)) + beta(cond))).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        cond_dim: int,
+        is_first: bool = False,
+        omega_0: float = 30.0,
+    ) -> None:
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.gamma = nn.Linear(cond_dim, out_features)
+        self.beta = nn.Linear(cond_dim, out_features)
+        self.is_first = is_first
+        self.omega_0 = omega_0
+        self.init_weights()
+
+    def init_weights(self) -> None:
+        with torch.no_grad():
+            if self.is_first:
+                bound = 1.0 / self.linear.in_features
+            else:
+                bound = np.sqrt(6.0 / self.linear.in_features) / self.omega_0
+
+            self.linear.weight.uniform_(-bound, bound)
+            if self.linear.bias is not None:
+                self.linear.bias.uniform_(-bound, bound)
+
+            # Start close to an unmodulated SIREN
+            nn.init.zeros_(self.gamma.weight)
+            nn.init.zeros_(self.gamma.bias)
+            nn.init.zeros_(self.beta.weight)
+            nn.init.zeros_(self.beta.bias)
+
+    @override
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        h = self.linear(x)
+        gamma = self.gamma(cond)
+        beta = self.beta(cond)
+        h = h * (1.0 + gamma) + beta
+        return torch.sin(self.omega_0 * h)
+
+
+class ForwardCondSIRENStateModel(nn.Module):
+    """
+    Conditional SIREN for:
+        (physical parameters, x, y, z) -> (Re(psi), Im(psi)).
+
+    Recommended:
+    - params: standardized physical inputs
+    - coords: normalized to [-1, 1]
+    """
+
+    def __init__(
+        self,
+        param_dim: int = 12,  # e.g. depth, height, offset, beta, a1x, a2x, a2y, z_height, theta, phi, energy, mass
+        coord_dim: int = 3,  # x, y, z
+        cond_dim: int = 64,
+        hidden_dim: int = 64,
+        output_dim: int = 2,
+        num_siren_layers: int = 4,
+        first_omega_0: float = 30.0,
+        hidden_omega_0: float = 1.0,
+    ) -> None:
+        super().__init__()
+
+        self.condition_encoder = ConditionEncoder(
+            param_dim=param_dim, cond_dim=cond_dim
+        )
+
+        layers = []
+        layers.append(
+            FiLMSineLayer(
+                in_features=coord_dim,
+                out_features=hidden_dim,
+                cond_dim=cond_dim,
+                is_first=True,
+                omega_0=first_omega_0,
+            )
+        )
+        layers.extend(
+            FiLMSineLayer(
+                in_features=hidden_dim,
+                out_features=hidden_dim,
+                cond_dim=cond_dim,
+                is_first=False,
+                omega_0=hidden_omega_0,
+            )
+            for _ in range(num_siren_layers - 1)
+        )
+
+        self.siren_layers = nn.ModuleList(layers)
+        self.head = nn.Linear(hidden_dim, output_dim)
+
+    @override
+    def forward(self, params: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        """
+        params: (B, param_dim)
+        coords: (B, 3)  normalized spatial coordinates, preferably in [-1, 1].
+        """
+        cond = self.condition_encoder(params)
+
+        x = coords
+        for layer in self.siren_layers:
+            x = layer(x, cond)
+
+        return self.head(x)
+
+
 class ForwardStateModel(nn.Module):
     """Predicts uppered state from 15 parameters using a deep ResNet at each grid."""
 
     def __init__(
-        self,
-        input_dim: int = 15,
-        hidden_dim: int = 50,
-        output_dim: int = 2,
+        self, input_dim: int = 15, hidden_dim: int = 512, output_dim: int = 2
     ) -> None:
         super().__init__()
 
@@ -551,10 +686,11 @@ def _make_coords(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    xs = torch.linspace(-1, 1, Nx, device=device, dtype=dtype)
-    ys = torch.linspace(-1, 1, Ny, device=device, dtype=dtype)
-    zs = torch.linspace(-1, 1, Nz, device=device, dtype=dtype)
+    xs = torch.fft.fftfreq(Nx, device=device, dtype=dtype) * 2
+    ys = torch.fft.fftfreq(Ny, device=device, dtype=dtype) * 2
+    zs = torch.fft.fftfreq(Nz, device=device, dtype=dtype) * 2
 
+    # Create the 3D grid
     grid = torch.stack(
         torch.meshgrid(xs, ys, zs, indexing="ij"),
         dim=-1,
@@ -566,85 +702,82 @@ def _make_coords(
 def predict_chi_batch_from_params(
     forward_model: nn.Module,
     params_batch: torch.Tensor,
-    chi_batch: list[torch.Tensor],
-) -> list[torch.Tensor]:
+    coords: torch.Tensor,
+    Nx: int,
+    Ny: int,
+    Nz: int,
+) -> torch.Tensor:
     """
-    Reconstruct a batch of chi grids from parameters using a pointwise forward model.
+    Vectorized prediction of chi on a fixed grid for a batch of physical setups.
 
-    Assumes:
-        chi_batch shape  = (B, 2, Nx, Ny, Nz)
-        params_batch shape = (B, 15)
+    Parameters
+    ----------
+    forward_model:
+        Model with signature forward_model(params, coords) -> (B, 2) or (B*N_pts, 2)
+        depending on how it is implemented.
+    params_batch:
+        Tensor of shape (B, 12), containing only the physical parameters.
+    coords:
+        Tensor of shape (N_pts, 3), normalized spatial coordinates.
+    Nx, Ny, Nz:
+        Grid dimensions used only for reshaping.
 
     Returns
     -------
-        chi_pred_batch shape = (B, 2, Nx, Ny, Nz)
+    pred_batch:
+        Tensor of shape (B, 2, Nx, Ny, Nz).
     """
-    if len(chi_batch) == 0:
-        return []
+    if params_batch.ndim != 2:
+        msg = f"params_batch must have shape (B, 12), got {params_batch.shape}"
+        raise ValueError(msg)
+    if coords.ndim != 2 or coords.shape[-1] != 3:
+        msg = f"coords must have shape (N_pts, 3), got {coords.shape}"
+        raise ValueError(msg)
+    if params_batch.shape[-1] != 12:
+        msg = f"params_batch must have 12 physical parameters, got {params_batch.shape[-1]}"
+        raise ValueError(msg)
 
     device = params_batch.device
     dtype = params_batch.dtype
-    out: list[torch.Tensor] = []
 
-    # Fast path: all volumes have the same spatial shape.
-    shapes = [(chi.shape[1], chi.shape[2], chi.shape[3]) for chi in chi_batch]
-    if len(set(shapes)) == 1:
-        Nx, Ny, Nz = shapes[0]
-        coords = _make_coords(Nx, Ny, Nz, device=device, dtype=dtype)
-        n_pts = coords.shape[0]
+    B = params_batch.shape[0]
+    N_pts = coords.shape[0]
 
-        # Build one big input tensor: (B * n_pts, 15)
-        prefix = params_batch[:, :-3].unsqueeze(1).expand(-1, n_pts, -1)
-        coords_rep = coords.unsqueeze(0).expand(params_batch.size(0), -1, -1)
+    coords = coords.to(device=device, dtype=dtype)
 
-        model_in = torch.cat(
-            [prefix.reshape(-1, params_batch.shape[-1] - 3), coords_rep.reshape(-1, 3)],
-            dim=-1,
-        )
+    # Repeat parameters for each spatial point
+    phys_params_rep = params_batch.unsqueeze(1).expand(B, N_pts, 12)  # (B, N_pts, 12)
+    coords_rep = coords.unsqueeze(0).expand(B, N_pts, 3)  # (B, N_pts, 3)
 
-        pred = forward_model(model_in)  # (B * n_pts, 2)
-        pred = pred.view(params_batch.size(0), n_pts, 2).transpose(1, 2).contiguous()
+    # Flatten into one big batch of points
+    phys_params_flat = phys_params_rep.reshape(B * N_pts, 12)  # (B*N_pts, 12)
+    coords_flat = coords_rep.reshape(B * N_pts, 3)  # (B*N_pts, 3)
 
-        return [pred[i].view(2, Nx, Ny, Nz) for i in range(pred.size(0))]
+    # Conditional model forward pass
+    pred_flat = forward_model(phys_params_flat, coords_flat)  # (B*N_pts, 2)
 
-    # Fallback: different spatial shapes, still avoid per-point loops.
-    for ind, chi in enumerate(chi_batch):
-        _, Nx, Ny, Nz = chi.shape
-        coords = _make_coords(Nx, Ny, Nz, device=device, dtype=dtype)
+    if pred_flat.ndim != 2 or pred_flat.shape[-1] != 2:
+        msg = f"forward_model must return shape (B*N_pts, 2), got {pred_flat.shape}"
+        raise ValueError(msg)
 
-        n_pts = coords.shape[0]
-        prefix = params_batch[ind, :-3].expand(n_pts, -1)
-        model_in = torch.cat([prefix, coords], dim=-1)  # (n_pts, 15)
+    # Reshape back to grid form
+    pred_batch = pred_flat.view(B, N_pts, 2).transpose(1, 2).contiguous()
 
-        pred = forward_model(model_in)  # (n_pts, 2)
-        pred = pred.view(Nx, Ny, Nz, 2).permute(3, 0, 1, 2).contiguous()
-        out.append(pred)
-
-    return out
+    return pred_batch.view(B, 2, Nx, Ny, Nz)
 
 
 def train() -> None:  # noqa: PLR0914, PLR0915
     dataset = load_datasets()
     train_dataset, val_dataset = random_split(dataset, [0.8, 0.2])
 
-    def collate_variable(batch) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        xs, ys = zip(*batch, strict=False)
-
-        xs = torch.stack(xs)  # X has fixed size
-        ys = list(ys)  # Y has variable size
-        return xs, ys
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=1, shuffle=True, collate_fn=collate_variable
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=1, shuffle=False, collate_fn=collate_variable
-    )
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
 
     # 2. Initialize Models
-    forward_model = ForwardStateModel().to(DEVICE)
+    forward_model = ForwardCondSIRENStateModel().to(DEVICE)
+    coord = _make_coords(Nx, Ny, Nz, device=DEVICE, dtype=torch.float32)
 
-    checkpoint = Path("data/15/best_chi_forward_model.pth")
+    checkpoint = Path("data/15/best_chi_SIREN_forward_model.pth")
     if checkpoint.exists():
         forward_model.load_state_dict(torch.load(checkpoint, map_location=DEVICE))
         print(f"Loaded pretrained model from {checkpoint}")
@@ -694,8 +827,8 @@ def train() -> None:  # noqa: PLR0914, PLR0915
     print(f"Using device: {DEVICE}")
 
     def loss_for_tensor_lists(
-        preds: list[torch.Tensor],
-        targets: list[torch.Tensor],
+        preds: torch.Tensor,
+        targets: torch.Tensor,
         criterion: nn.Module | None = None,
     ) -> torch.Tensor:
 
@@ -713,87 +846,45 @@ def train() -> None:  # noqa: PLR0914, PLR0915
 
         return loss / len(preds)
 
-    def loss_for_Uppered_tensor_lists(
-        preds: list[torch.Tensor],
-        targets: list[torch.Tensor],
-        params,
-        criterion: nn.Module | None = None,
-    ) -> torch.Tensor:
-
-        if len(preds) != len(targets):
-            msg = f"Length mismatch: {len(preds)} preds vs {len(targets)} targets"
-            raise ValueError(msg)
-
-        if criterion is None:
-            criterion = nn.MSELoss()
-
-        config = OptimizationConfig(precision=1e-5, max_iterations=1000, n_channels=250)
-
-        loss = torch.zeros((), device=preds[0].device, dtype=preds[0].dtype)
-
-        def get_uppered_state_from_lowered_state_data(data, param):
-            actual_condition = condition_from_params(param.detach().cpu().numpy())
-            converted_condition = _as_natural_units(actual_condition)
-            stat_data = data[0] + 1j * data[1]
-
-            _, _lower, upper = _build_scipy_operators(
-                converted_condition, n_channels=config.n_channels
-            )
-
-            # Convert the data to a State object
-            state = State(
-                close_coupling_basis(converted_condition.metadata).upcast(),
-                stat_data.detach().cpu().numpy(),
-            )
-
-            # Apply the upper operator to get the uppered state
-            Uppered_solution = upper.matvec(
-                get_preconditioned_state_from_state(
-                    state, actual_condition, n_channels=config.n_channels
-                )
-                .with_basis(close_coupling_basis(actual_condition.metadata))
-                .raw_data
-            ).reshape(actual_condition.metadata.shape)
-
-            Uppered_state = State(
-                close_coupling_basis(actual_condition.metadata).upcast(),
-                cast(
-                    "np.ndarray[tuple[int], np.dtype[np.complex128]]", Uppered_solution
-                ),
-            )
-
-            Uppered_data = Uppered_state.with_basis(
-                close_coupling_basis(actual_condition.metadata)
-            ).raw_data.reshape(actual_condition.metadata.shape)
-
-            return torch.from_numpy(
-                np.array([Uppered_data.real, Uppered_data.imag])
-            ).to(device=preds[0].device, dtype=preds[0].dtype)
-
-        for param, pred, target in zip(params, preds, targets, strict=True):
-            Uppered_pred = get_uppered_state_from_lowered_state_data(pred, param)
-            Uppered_target = get_uppered_state_from_lowered_state_data(target, param)
-            loss += criterion(Uppered_pred, Uppered_target)
-
-        return loss / len(preds)
-
     for epoch in range(epochs):
         forward_model.train()
 
         train_loss_f = 0.0
         # train_loss_b = 0.0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}", unit="batch")
 
-        for params_batch, chi_batch in train_loader:
+        for batch_idx, (params_batch, preconditioned_state_batch) in enumerate(pbar):
+            t0 = time.perf_counter()
             params_batch = params_batch.to(DEVICE)  # noqa: PLW2901
-            chi_batch = [chi.to(DEVICE) for chi in chi_batch]  # noqa: PLW2901
-            chi_pred_batch = predict_chi_batch_from_params(
-                forward_model, params_batch, chi_batch
+            preconditioned_state_batch = preconditioned_state_batch.to(DEVICE)  # noqa: PLW2901
+            # --- Forward Model Update ---
+            forward_optimizer.zero_grad()
+            preconditioned_state_pred = predict_chi_batch_from_params(
+                forward_model=forward_model,
+                params_batch=params_batch[:, :12],
+                coords=coord,
+                Nx=Nx,
+                Ny=Ny,
+                Nz=Nz,
             )
-            loss_f = loss_for_tensor_lists(chi_pred_batch, chi_batch, forward_criterion)
+            t1 = time.perf_counter()
+            loss_f = forward_criterion(
+                preconditioned_state_pred, preconditioned_state_batch
+            )
             loss_f.backward()
+            t2 = time.perf_counter()
             forward_optimizer.step()
-
+            t3 = time.perf_counter()
             train_loss_f += loss_f.item()
+            avg_loss = train_loss_f / (batch_idx + 1)
+            pbar.set_postfix(
+                loss=f"{loss_f.item():.3e}",
+                avg=f"{avg_loss:.3e}",
+                pred=f"{t1 - t0:.2f}s",
+                back=f"{t2 - t1:.2f}s",
+                step=f"{t3 - t2:.2f}s",
+                lr=f"{forward_optimizer.param_groups[0]['lr']:.1e}",
+            )
 
         # --- Backward Model Update (TANDEM ARCHITECTURE) ---
         # with freeze_parameters(forward_model):
@@ -810,19 +901,31 @@ def train() -> None:  # noqa: PLR0914, PLR0915
         # backward_model.eval()
 
         val_loss_f = 0.0
-
+        pbar_val = tqdm(val_loader, desc=f"Val {epoch + 1}/{epochs}", unit="batch")
         with torch.no_grad():
-            for params_batch, chi_batch in val_loader:
+            for batch_idx, (params_batch, preconditioned_state_batch) in enumerate(
+                pbar_val
+            ):
                 params_batch = params_batch.to(DEVICE)  # noqa: PLW2901
-                chi_batch = [chi.to(DEVICE) for chi in chi_batch]  # noqa: PLW2901
+                preconditioned_state_batch = preconditioned_state_batch.to(DEVICE)  # noqa: PLW2901
 
                 # Forward Model Validation
-                chi_pred_batch = predict_chi_batch_from_params(
-                    forward_model, params_batch, chi_batch
+                preconditioned_state_pred = predict_chi_batch_from_params(
+                    forward_model=forward_model,
+                    params_batch=params_batch[:, :12],
+                    coords=coord,
+                    Nx=Nx,
+                    Ny=Ny,
+                    Nz=Nz,
                 )
-                val_loss_f += loss_for_tensor_lists(
-                    chi_pred_batch, chi_batch, forward_criterion
+                val_loss_f += forward_criterion(
+                    preconditioned_state_pred, preconditioned_state_batch
                 ).item()
+                avg_val = val_loss_f / (batch_idx + 1)
+                pbar_val.set_postfix(
+                    loss=f"{forward_criterion(preconditioned_state_pred, preconditioned_state_batch).item():.3e}",
+                    avg=f"{avg_val:.3e}",
+                )
 
                 # Backward Model Validation (Tandem)
                 # predicted = backward_model(chi_batch)
@@ -854,7 +957,9 @@ def train() -> None:  # noqa: PLR0914, PLR0915
 
         if average_val_loss_f < best_val_loss_f:
             best_val_loss_f = average_val_loss_f
-            torch.save(forward_model.state_dict(), "data/15/best_chi_forward_model.pth")
+            torch.save(
+                forward_model.state_dict(), "data/15/best_chi_SIREN_forward_model.pth"
+            )
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -865,8 +970,8 @@ def train() -> None:  # noqa: PLR0914, PLR0915
 
     print("Training complete.")
 
-    torch.save(forward_model.state_dict(), "data/15/chi_forward_model.pth")
-    # torch.save(backward_model.state_dict(), "data/15/chi_backward_model.pth")
+    torch.save(forward_model.state_dict(), "data/15/chi_SIREN_forward_model.pth")
+    # torch.save(backward_model.state_dict(), "data/15/chi_SIREN_backward_model.pth")
 
 
 def test() -> None:
@@ -900,19 +1005,34 @@ def test() -> None:
 
     test_params = params_from_condition(condition0)
     condition = condition_from_params(test_params)
-    forward_model = ForwardStateModel().to(DEVICE)
+
+    Nx, Ny, Nz = condition.metadata.shape
+    coords = _make_coords(Nx, Ny, Nz, device=DEVICE, dtype=torch.float32)
+
+    forward_model = ForwardCondSIRENStateModel().to(DEVICE)
     forward_model.load_state_dict(
-        torch.load("data/15/best_chi_forward_model.pth", map_location=DEVICE),
+        torch.load("data/15/best_chi_SIREN_forward_model.pth", map_location=DEVICE),
     )
     forward_model.eval()
 
     with torch.no_grad():
-        channel_amp_dense_list = predict_chi_batch_from_params(
-            forward_model,
-            torch.tensor(test_params, dtype=torch.float32, device=DEVICE).unsqueeze(0),
-            [torch.empty((2, *condition.metadata.shape), device=DEVICE)],
+        param_tensor = torch.tensor(
+            test_params,
+            dtype=torch.float32,
+            device=DEVICE,
+        ).unsqueeze(0)  # shape: (1, 15) or (1, 12), depending on your params
+
+        channel_amp_dense_batch = predict_chi_batch_from_params(
+            forward_model=forward_model,
+            params_batch=param_tensor[:, :12],  # Only pass the physical parameters
+            coords=coords,
+            Nx=Nx,
+            Ny=Ny,
+            Nz=Nz,
         )
-        stat_data = channel_amp_dense_list[0][0] + 1j * channel_amp_dense_list[0][1]
+
+        channel_amp_dense = channel_amp_dense_batch[0]  # shape: (2, Nx, Ny, Nz)
+        stat_data = channel_amp_dense[0] + 1j * channel_amp_dense[1]
         preconditioned_pred_state = State(
             close_coupling_basis(condition.metadata).upcast(),
             stat_data.detach().cpu().numpy(),
@@ -943,8 +1063,8 @@ def test() -> None:
     fig, ax1 = plot.get_figure()
     ax1.set_xlabel("z")
     ax1.set_ylabel(r"$\psi_{00}(z)$")
-    ax1.plot(z[:100], preconditioned_actual_psi.real[:100], label="Actual real part")
-    ax1.plot(z[:100], precondtioned_pred_psi.real[:100], label="Predicted real part")
+    ax1.plot(z, preconditioned_actual_psi.real, label="Actual real part")
+    ax1.plot(z, precondtioned_pred_psi.real, label="Predicted real part")
     ax1.set_title("Actual and predicted scattering state")
     ax1.legend()
     fig.savefig("data/15/scattering_state.png")
