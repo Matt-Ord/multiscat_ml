@@ -28,11 +28,14 @@ from scipy.constants import (  # type: ignore[import-untyped]
     physical_constants,
 )
 from slate_core import Array, metadata, plot
+from slate_core.metadata import LobattoSpacedLengthMetadata
+from slate_core.metadata._spaced import Domain
 from slate_quantum import State, operator
 from torch import nn, optim
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
 from tqdm import tqdm
 
+a = LobattoSpacedLengthMetadata
 # Constants
 HELIUM_MASS = physical_constants["alpha particle mass"][0]
 HELIUM_ENERGY = 20 * electron_volt * 10**-3
@@ -297,7 +300,7 @@ def format_intensity_map(
     return "\n".join(lines)
 
 
-def generate_dataset_hdf5(filepath: Path, num_samples: int = 50) -> None:
+def generate_dataset_hdf5(filepath: Path, num_samples: int = 500) -> None:
     """Generate parameters and Preconditioned state, saving them directly to disk."""
     filepath.parent.mkdir(parents=True, exist_ok=True)
     if filepath.exists():
@@ -386,15 +389,15 @@ def freeze_parameters(model: nn.Module) -> Any:  # noqa: ANN401
 
 
 def generate() -> None:
-    for i in range(10):
+    for i in range(17):
         data_path = Path(f"data/15/preconditioned_state_data_{i}.hdf5")
-        generate_dataset_hdf5(data_path, num_samples=50)
+        generate_dataset_hdf5(data_path, num_samples=500)
 
 
 def load_datasets() -> ConcatDataset[tuple[torch.Tensor, torch.Tensor]]:
     datasets = [
         HDF5ScatteringDataset(Path(f"data/15/preconditioned_state_data_{i}.hdf5"))
-        for i in range(5)
+        for i in range(17)
     ]
     return ConcatDataset[tuple[torch.Tensor, torch.Tensor]](datasets)
 
@@ -458,11 +461,11 @@ class ConditionEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(param_dim, 128),
+            nn.Linear(param_dim, 256),
             nn.GELU(),
-            nn.Linear(128, 128),
+            nn.Linear(256, 256),
             nn.GELU(),
-            nn.Linear(128, cond_dim),
+            nn.Linear(256, cond_dim),
         )
 
     @override
@@ -536,8 +539,8 @@ class ForwardCondSIRENStateModel(nn.Module):
         hidden_dim: int = 64,
         output_dim: int = 2,
         num_siren_layers: int = 4,
-        first_omega_0: float = 30.0,
-        hidden_omega_0: float = 1.0,
+        first_omega_0: float = 15.0,
+        hidden_omega_0: float = 15.0,
     ) -> None:
         super().__init__()
 
@@ -669,14 +672,7 @@ class SparseScatteringLoss(nn.Module):
         weight_mask = 1.0 + (self.peak_weight * torch.abs(y_true))
 
         # Apply the weight and take the mean
-        weighted_mse = torch.mean(base_error * weight_mask)
-
-        # 3. Sparsity Penalty (L1)
-        # This constantly applies a tiny downward pressure on all predicted values,
-        # forcing the network to snap the background noise to exactly 0.0
-        sparsity_loss = torch.mean(torch.abs(y_pred))
-
-        return weighted_mse + (self.sparsity_weight * sparsity_loss)
+        return torch.mean(base_error * weight_mask)
 
 
 def _make_coords(
@@ -688,7 +684,10 @@ def _make_coords(
 ) -> torch.Tensor:
     xs = torch.fft.fftfreq(Nx, device=device, dtype=dtype) * 2
     ys = torch.fft.fftfreq(Ny, device=device, dtype=dtype) * 2
-    zs = torch.fft.fftfreq(Nz, device=device, dtype=dtype) * 2
+    z_domain = Domain(start=-1.0, delta=2.0)
+    z_metadata = LobattoSpacedLengthMetadata(fundamental_size=Nz, domain=z_domain)
+    zs_np = z_metadata.values
+    zs = torch.from_numpy(zs_np).to(device=device, dtype=dtype)
 
     # Create the 3D grid
     grid = torch.stack(
@@ -770,14 +769,14 @@ def train() -> None:  # noqa: PLR0914, PLR0915
     dataset = load_datasets()
     train_dataset, val_dataset = random_split(dataset, [0.8, 0.2])
 
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
 
     # 2. Initialize Models
     forward_model = ForwardCondSIRENStateModel().to(DEVICE)
     coord = _make_coords(Nx, Ny, Nz, device=DEVICE, dtype=torch.float32)
 
-    checkpoint = Path("data/15/best_chi_SIREN_forward_model.pth")
+    checkpoint = Path("data/15/best_chi_SIREN_forward_model-2.pth")
     if checkpoint.exists():
         forward_model.load_state_dict(torch.load(checkpoint, map_location=DEVICE))
         print(f"Loaded pretrained model from {checkpoint}")
@@ -958,7 +957,7 @@ def train() -> None:  # noqa: PLR0914, PLR0915
         if average_val_loss_f < best_val_loss_f:
             best_val_loss_f = average_val_loss_f
             torch.save(
-                forward_model.state_dict(), "data/15/best_chi_SIREN_forward_model.pth"
+                forward_model.state_dict(), "data/15/best_chi_SIREN_forward_model-2.pth"
             )
             epochs_without_improvement = 0
         else:
@@ -970,7 +969,7 @@ def train() -> None:  # noqa: PLR0914, PLR0915
 
     print("Training complete.")
 
-    torch.save(forward_model.state_dict(), "data/15/chi_SIREN_forward_model.pth")
+    torch.save(forward_model.state_dict(), "data/15/chi_SIREN_forward_model-2.pth")
     # torch.save(backward_model.state_dict(), "data/15/chi_SIREN_backward_model.pth")
 
 
@@ -1011,7 +1010,7 @@ def test() -> None:
 
     forward_model = ForwardCondSIRENStateModel().to(DEVICE)
     forward_model.load_state_dict(
-        torch.load("data/15/best_chi_SIREN_forward_model.pth", map_location=DEVICE),
+        torch.load("data/15/best_chi_SIREN_forward_model-2.pth", map_location=DEVICE),
     )
     forward_model.eval()
 
@@ -1050,16 +1049,14 @@ def test() -> None:
     # Return the real and imaginary parts of the preconditioned state
     preconditioned_actual_psi = preconditioned_state.with_basis(
         close_coupling_basis(condition.metadata)
-    ).raw_data.reshape(condition.metadata.shape)[2, 3, :]
+    ).raw_data.reshape(condition.metadata.shape)[0, 0, :]
 
     precondtioned_pred_psi = preconditioned_pred_state.with_basis(
         close_coupling_basis(condition.metadata)
-    ).raw_data.reshape(condition.metadata.shape)[2, 3, :]
+    ).raw_data.reshape(condition.metadata.shape)[0, 0, :]
 
     _, metadata_z = split_scattering_metadata(condition.metadata)
-    height = metadata_z.domain.delta
-    nz = condition.metadata.shape[2]
-    z = np.linspace(0, height, nz)
+    z = metadata_z.values
     fig, ax1 = plot.get_figure()
     ax1.set_xlabel("z")
     ax1.set_ylabel(r"$\psi_{00}(z)$")
@@ -1067,7 +1064,7 @@ def test() -> None:
     ax1.plot(z, precondtioned_pred_psi.real, label="Predicted real part")
     ax1.set_title("Actual and predicted scattering state")
     ax1.legend()
-    fig.savefig("data/15/scattering_state.png")
+    fig.savefig("/workspaces/multiscat_ml/data/15/scattering_state.png")
 
 
 if __name__ == "__main__":
