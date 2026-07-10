@@ -1,9 +1,11 @@
 import contextlib
+import json
 import time
 from pathlib import Path
 from typing import Any, cast, override
 
 import h5py  # type: ignore[import-untyped]
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from multiscat import OptimizationConfig
@@ -16,6 +18,7 @@ from multiscat.config import MorseScatteringCondition, momentum_from_angles
 from multiscat.multiscat import (
     _as_natural_units,
     get_preconditioned_state_from_state,
+    get_scattering_matrix_from_preconditioned_state,
     get_scattering_state,
 )
 from multiscat.multiscat._scipy import (
@@ -338,36 +341,42 @@ def generate_dataset_hdf5(filepath: Path, num_samples: int = 500) -> None:
 
 
 class HDF5ScatteringDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
-    """A PyTorch Dataset that reads scattering data from an HDF5 file on demand."""
+    """An optimized Dataset that preloads scattering data completely into RAM."""
 
     def __init__(self, filepath: Path) -> None:
         self.filepath = filepath
-        self.file = None
 
-        try:
-            with h5py.File(filepath, "r") as f:
-                self.length: int = f["X"].shape[0]  # type: ignore[hd5]
-        except FileNotFoundError:
-            self.length = 0
+        # Open, read everything into RAM instantly, and close immediately
+        with h5py.File(name=filepath, mode="r") as f:
+            print(f"--> Preloading {filepath.name} entirely into system RAM...")
+            # Loading full arrays into memory
+            X_raw = torch.from_numpy(f["X"][:]).float()
+            Y_raw = torch.from_numpy(f["Y"][:]).float()
+
+        Y_complex = torch.complex(
+            Y_raw[:, 0, ...], Y_raw[:, 1, ...]
+        )  # Shape: (B, Nx, Ny, Nz)
+
+        print("--> Computing 2D Fourier Transform over the x-y plane...")
+        # 3. Perform 2D FFT over the kx (dim=1) and ky (dim=2) dimensions
+        # We shift low frequencies to the center using fftshift for physical correctness
+        Y_fft = torch.fft.fftshift(torch.fft.fft2(Y_complex, dim=(1, 2)), dim=(1, 2))
+
+        # 4. Pack it back into a split Real/Imaginary view if your SIREN model expects 2 channels
+        self.Y_data = torch.stack(
+            [Y_fft.real, Y_fft.imag], dim=1
+        )  # Shape: (B, 2, Nx, Ny, Nz)
+        self.X_data = X_raw
+
+        self.length = self.X_data.shape[0]
+        print(f"--> Caching complete! Loaded {self.length} samples.")
 
     def __len__(self) -> int:
-        """Get the length."""
         return self.length
 
-    @override
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:  # ty:ignore[invalid-method-override]
-        # Lazy initialization of the HDF5 file handler.
-        # This is best practice to avoid errors if using multiple DataLoader workers.
-        if self.file is None:
-            self.file = h5py.File(self.filepath, "r")
-
-        x_tensor = torch.from_numpy(self.file["X"][idx]).float()
-        y_tensor = torch.from_numpy(self.file["Y"][idx]).float()
-        return x_tensor, y_tensor
-
-    def __del__(self) -> None:
-        if self.file is not None:
-            self.file.close()
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        # Fast RAM slice—no disk reading overhead!
+        return self.X_data[index], self.Y_data[index]
 
 
 @contextlib.contextmanager
@@ -389,7 +398,7 @@ def freeze_parameters(model: nn.Module) -> Any:  # noqa: ANN401
 
 
 def generate() -> None:
-    for i in range(17):
+    for i in range(50):
         data_path = Path(f"data/15/preconditioned_state_data_{i}.hdf5")
         generate_dataset_hdf5(data_path, num_samples=500)
 
@@ -397,7 +406,7 @@ def generate() -> None:
 def load_datasets() -> ConcatDataset[tuple[torch.Tensor, torch.Tensor]]:
     datasets = [
         HDF5ScatteringDataset(Path(f"data/15/preconditioned_state_data_{i}.hdf5"))
-        for i in range(17)
+        for i in range(50)
     ]
     return ConcatDataset[tuple[torch.Tensor, torch.Tensor]](datasets)
 
@@ -428,7 +437,7 @@ class SirenLayer(nn.Module):
         in_features,
         out_features,
         is_first=False,
-        omega_0=30.0,
+        omega_0=15.0,
     ) -> None:
         super().__init__()
 
@@ -485,7 +494,7 @@ class FiLMSineLayer(nn.Module):
         out_features: int,
         cond_dim: int,
         is_first: bool = False,
-        omega_0: float = 30.0,
+        omega_0: float = 15.0,
     ) -> None:
         super().__init__()
         self.linear = nn.Linear(in_features, out_features)
@@ -580,7 +589,7 @@ class ForwardCondSIRENStateModel(nn.Module):
         """
         cond = self.condition_encoder(params)
 
-        x = coords
+        x = coords  # Shape: (N_pts, 3)
         for layer in self.siren_layers:
             x = layer(x, cond)
 
@@ -624,33 +633,6 @@ class ForwardStateModel(nn.Module):
         return out.view(-1, 2)
 
 
-class BackwardStateModel(nn.Module):
-    """Predicts parameters from one whole grid."""
-
-    def __init__(self, nx: int, ny: int, nz: int) -> None:
-        super().__init__()
-        in_dim = 2 * nx * ny * nz
-
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 128),
-            nn.LayerNorm(128),
-            nn.GELU(),
-            nn.Linear(128, 64),
-            nn.LayerNorm(64),
-            nn.GELU(),
-            nn.Linear(64, 32),
-            nn.LayerNorm(32),
-            nn.GELU(),
-            nn.Linear(32, 15),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, 2, Nx, Ny, Nz)
-        x = x.flatten(start_dim=1)  # (B, 2*Nx*Ny*Nz)
-        return self.net(x)  # (B, 15)
-
-
 class SparseScatteringLoss(nn.Module):
     def __init__(
         self,
@@ -675,6 +657,79 @@ class SparseScatteringLoss(nn.Module):
         return torch.mean(base_error * weight_mask)
 
 
+class RelativePhysicalLoss(nn.Module):
+    """
+    Magnitude-invariant loss function tailored for continuous fields in position space.
+    Normalizes errors by the local magnitude of the true signal.
+    """
+
+    def __init__(self, eps: float = 1e-4) -> None:
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        # Squared error at every single voxel
+        squared_error = (y_pred - y_true) ** 2
+
+        # Calculate the magnitude/intensity baseline for normalization at each voxel
+        # y_true shape is (B, 2, Nx, Ny, Nz). We look at local intensity.
+        true_magnitude = torch.abs(y_true)
+
+        # Relative scaling: Normalize error by true magnitude + a small stabilizing floor (eps)
+        relative_error = squared_error / (true_magnitude + self.eps)
+
+        # Return the overall mean
+        return torch.mean(relative_error)
+
+
+class WavePhysicsLoss(nn.Module):
+    def __init__(self, eps=1e-8) -> None:
+        super().__init__()
+        self.eps = eps
+        self.cosine = nn.CosineSimilarity(dim=-1)  # Assumes flattened spatial grid
+
+    def forward(self, pred, target):
+        # 1. Relative L2 Loss (Captures balanced structural scaling)
+        diff_norm = torch.norm(pred - target, p=2, dim=-1)
+        target_norm = torch.norm(target, p=2, dim=-1)
+        rel_l2 = torch.mean(diff_norm / (target_norm + self.eps))
+
+        # 2. Phase Alignment Loss (Ensures peaks and troughs line up horizontally)
+        # Cosine similarity outputs 1.0 for perfect alignment. We want to minimize (1 - similarity)
+        phase_loss = torch.mean(1.0 - self.cosine(pred, target))
+
+        # Combined Loss (Balanced 50/50 split)
+        return rel_l2 + 1.0 * phase_loss
+
+
+class AmplitudeAwarePhysicsLoss(nn.Module):
+    def __init__(self, eps=1e-8) -> None:
+        super().__init__()
+        self.eps = eps
+        self.cosine = nn.CosineSimilarity(dim=-1)
+
+    def forward(self, pred, target):
+        # 1. Compute the structural Relative L2 Error
+        diff_norm = torch.norm(pred - target, p=2, dim=-1)
+        target_norm = torch.norm(target, p=2, dim=-1)
+        rel_l2 = torch.mean(diff_norm / (target_norm + self.eps))
+
+        # 2. Compute the standard phase alignment
+        phase_alignment = self.cosine(pred, target)
+        phase_loss = torch.mean(1.0 - phase_alignment)
+
+        # 3. The Amplitude Penalty (The Fix)
+        # Compute the ratio of the predicted variance/energy vs true variance/energy
+        pred_var = torch.var(pred, dim=-1)
+        target_var = torch.var(target, dim=-1)
+        amplitude_ratio_loss = torch.mean(
+            torch.abs(pred_var - target_var) / (target_var + self.eps)
+        )
+
+        # Combine them: Total loss forces exact envelope height AND exact phase shifts
+        return rel_l2 + 0.5 * phase_loss + 1.0 * amplitude_ratio_loss
+
+
 def _make_coords(
     Nx: int,
     Ny: int,
@@ -682,8 +737,8 @@ def _make_coords(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    xs = torch.fft.fftfreq(Nx, device=device, dtype=dtype) * 2
-    ys = torch.fft.fftfreq(Ny, device=device, dtype=dtype) * 2
+    xs = torch.linspace(-1.0, 1.0, steps=Nx + 1, device=device, dtype=dtype)[:-1]
+    ys = torch.linspace(-1.0, 1.0, steps=Ny + 1, device=device, dtype=dtype)[:-1]
     z_domain = Domain(start=-1.0, delta=2.0)
     z_metadata = LobattoSpacedLengthMetadata(fundamental_size=Nz, domain=z_domain)
     zs_np = z_metadata.values
@@ -705,6 +760,7 @@ def predict_chi_batch_from_params(
     Nx: int,
     Ny: int,
     Nz: int,
+    chunk_size: int = 20000,
 ) -> torch.Tensor:
     """
     Vectorized prediction of chi on a fixed grid for a batch of physical setups.
@@ -744,39 +800,106 @@ def predict_chi_batch_from_params(
 
     coords = coords.to(device=device, dtype=dtype)
 
-    # Repeat parameters for each spatial point
-    phys_params_rep = params_batch.unsqueeze(1).expand(B, N_pts, 12)  # (B, N_pts, 12)
-    coords_rep = coords.unsqueeze(0).expand(B, N_pts, 3)  # (B, N_pts, 3)
+    # List to store the output chunks
+    pred_chunks = []
 
-    # Flatten into one big batch of points
-    phys_params_flat = phys_params_rep.reshape(B * N_pts, 12)  # (B*N_pts, 12)
-    coords_flat = coords_rep.reshape(B * N_pts, 3)  # (B*N_pts, 3)
+    # Loop through the spatial points in safe, bite-sized pieces
+    for i in range(0, N_pts, chunk_size):
+        coords_chunk = coords[i : i + chunk_size]  # Shape: (chunk_N, 3)
+        chunk_N = coords_chunk.shape[0]
 
-    # Conditional model forward pass
-    pred_flat = forward_model(phys_params_flat, coords_flat)  # (B*N_pts, 2)
+        # Expand only this tiny chunk to match the batch size
+        phys_params_rep = params_batch.unsqueeze(1).expand(
+            B, chunk_N, 12
+        )  # (B, chunk_N, 12)
+        coords_rep = coords_chunk.unsqueeze(0).expand(B, chunk_N, 3)  # (B, chunk_N, 3)
 
-    if pred_flat.ndim != 2 or pred_flat.shape[-1] != 2:
-        msg = f"forward_model must return shape (B*N_pts, 2), got {pred_flat.shape}"
-        raise ValueError(msg)
+        # Flatten just this chunk
+        phys_params_flat = phys_params_rep.reshape(B * chunk_N, 12)
+        coords_flat = coords_rep.reshape(B * chunk_N, 3)
 
-    # Reshape back to grid form
-    pred_batch = pred_flat.view(B, N_pts, 2).transpose(1, 2).contiguous()
+        # Forward pass for the chunk (fits comfortably in VRAM!)
+        pred_flat_chunk = forward_model(phys_params_flat, coords_flat)  # (B*chunk_N, 2)
 
+        if pred_flat_chunk.ndim != 2 or pred_flat_chunk.shape[-1] != 2:
+            msg = f"forward_model must return shape (B*N_pts, 2), got {pred_flat_chunk.shape}"
+            raise ValueError(msg)
+
+        # Reshape the chunk back to (B, chunk_N, 2)
+        pred_chunk_reshaped = pred_flat_chunk.view(B, chunk_N, 2)
+        pred_chunks.append(pred_chunk_reshaped)
+
+    # Reconstruct the full spatial field along the points dimension
+    full_pred = torch.cat(pred_chunks, dim=1)  # Shape: (B, N_pts, 2)
+
+    # Rearrange dimensions and view as the requested 3D grid
+    pred_batch = full_pred.transpose(1, 2).contiguous()
     return pred_batch.view(B, 2, Nx, Ny, Nz)
+
+
+def plot_training_convergence(history: dict, save_path: Path) -> None:
+    """Generates a publication-grade log-scale convergence plot."""
+    # Use a clean aesthetic style
+    plt.style.use(
+        "seaborn-v0_8-whitegrid"
+        if "seaborn-v0_8-whitegrid" in plt.style.available
+        else "default"
+    )
+
+    _fig, ax = plt.subplots(figsize=(8, 5), dpi=300)
+    epochs_range = range(1, len(history["train_loss"]) + 1)
+
+    # Plot training and validation tracks
+    ax.plot(
+        epochs_range,
+        history["train_loss"],
+        label="Training Loss",
+        color="#1f77b4",
+        linewidth=2,
+    )
+    ax.plot(
+        epochs_range,
+        history["val_loss"],
+        label="Validation Loss",
+        color="#ff7f0e",
+        linewidth=2,
+        linestyle="--",
+    )
+
+    # Crucial scientific step: Logarithmic scale for wide dynamic ranges
+    ax.set_yscale("log")
+
+    # Labels and metadata
+    ax.set_xlabel("Epochs", fontsize=12, fontweight="bold", labelpad=10)
+    ax.set_ylabel("Loss (Log Scale)", fontsize=12, fontweight="bold", labelpad=10)
+    ax.set_title(
+        "Model Convergence Profile Across Real Position Space",
+        fontsize=13,
+        fontweight="bold",
+        pad=15,
+    )
+
+    ax.legend(frameon=True, facecolor="white", edgecolor="none", fontsize=11)
+    ax.tick_params(axis="both", labelsize=10)
+
+    plt.tight_layout()
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close()
+    print(f"--> Convergence plot saved to: {save_path}")
 
 
 def train() -> None:  # noqa: PLR0914, PLR0915
     dataset = load_datasets()
     train_dataset, val_dataset = random_split(dataset, [0.8, 0.2])
 
-    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
     # 2. Initialize Models
     forward_model = ForwardCondSIRENStateModel().to(DEVICE)
     coord = _make_coords(Nx, Ny, Nz, device=DEVICE, dtype=torch.float32)
 
-    checkpoint = Path("data/15/best_chi_SIREN_forward_model-2.pth")
+    checkpoint = Path("data/15/best_chi_SIREN_forward_model-FT-3.pth")
     if checkpoint.exists():
         forward_model.load_state_dict(torch.load(checkpoint, map_location=DEVICE))
         print(f"Loaded pretrained model from {checkpoint}")
@@ -784,22 +907,12 @@ def train() -> None:  # noqa: PLR0914, PLR0915
         print("No pretrained model found. Training from scratch.")
 
     # noqa:
-    # backward_model = BackwardStateModel().to(DEVICE)
-
-    # backward_criterion = nn.MSELoss()
-    # maybe use TotalScatteringLoss(lambda_physics=0.01)
-    forward_criterion = SparseScatteringLoss(peak_weight=10.0, sparsity_weight=1e-5)
+    forward_criterion = AmplitudeAwarePhysicsLoss()
     forward_optimizer = optim.AdamW(
         forward_model.parameters(),
         lr=1e-3,
         weight_decay=1e-5,
     )
-
-    # backward_optimizer = optim.AdamW(
-    #     backward_model.parameters(),
-    #     lr=1e-3,
-    #     weight_decay=1e-5,
-    # )
 
     scheduler_f = optim.lr_scheduler.ReduceLROnPlateau(
         forward_optimizer,
@@ -808,42 +921,20 @@ def train() -> None:  # noqa: PLR0914, PLR0915
         patience=5,
     )
 
-    # scheduler_b = optim.lr_scheduler.ReduceLROnPlateau(
-    #     backward_optimizer,
-    #     mode="min",
-    #     factor=0.5,
-    #     patience=5,
-    # )
+    # 1. Initialize History Metrics Tracking Dictionary
+    loss_history = {"train_loss": [], "val_loss": []}
+    output_dir = Path("data/15")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     best_val_loss_f = float("inf")
     patience = 20
     epochs_without_improvement = 0
-    epochs = 150
+    epochs = 200
     print(
         f"Training on {len(train_dataset)} samples,"
         f"Validating on {len(val_dataset)} samples...",
     )
     print(f"Using device: {DEVICE}")
-
-    def loss_for_tensor_lists(
-        preds: torch.Tensor,
-        targets: torch.Tensor,
-        criterion: nn.Module | None = None,
-    ) -> torch.Tensor:
-
-        if len(preds) != len(targets):
-            msg = f"Length mismatch: {len(preds)} preds vs {len(targets)} targets"
-            raise ValueError(msg)
-
-        if criterion is None:
-            criterion = nn.MSELoss()
-
-        loss = torch.zeros((), device=preds[0].device, dtype=preds[0].dtype)
-
-        for pred, target in zip(preds, targets, strict=True):
-            loss += criterion(pred, target)
-
-        return loss / len(preds)
 
     for epoch in range(epochs):
         forward_model.train()
@@ -885,19 +976,8 @@ def train() -> None:  # noqa: PLR0914, PLR0915
                 lr=f"{forward_optimizer.param_groups[0]['lr']:.1e}",
             )
 
-        # --- Backward Model Update (TANDEM ARCHITECTURE) ---
-        # with freeze_parameters(forward_model):
-        # backward_optimizer.zero_grad()
-        # reconstructed_chi = forward_model(backward_model(chi_batch))
-        # loss_b = backward_criterion(reconstructed_chi, chi_batch)
-        # loss_b.backward()
-
-        # backward_optimizer.step()
-        # train_loss_b += loss_b.item()
-
         # --- VALIDATION PHASE ---
         forward_model.eval()
-        # backward_model.eval()
 
         val_loss_f = 0.0
         pbar_val = tqdm(val_loader, desc=f"Val {epoch + 1}/{epochs}", unit="batch")
@@ -926,27 +1006,19 @@ def train() -> None:  # noqa: PLR0914, PLR0915
                     avg=f"{avg_val:.3e}",
                 )
 
-                # Backward Model Validation (Tandem)
-                # predicted = backward_model(chi_batch)
-                # reconstructed_chi = forward_model(predicted)
-                # val_loss_b += backward_criterion(
-                #     reconstructed_chi,
-                #     chi_batch,
-                # ).item()
-
         # Averages
         average_train_loss_f = train_loss_f / len(train_loader)
         average_val_loss_f = val_loss_f / len(val_loader)
-        # average_train_loss_b = train_loss_b / len(train_loader)
-        # average_val_loss_b = val_loss_b / len(val_loader)
+
+        # 2. Append history metrics at the end of every epoch
+        loss_history["train_loss"].append(average_train_loss_f)
+        loss_history["val_loss"].append(average_val_loss_f)
 
         # Step the schedulers
         scheduler_f.step(average_val_loss_f)
-        # scheduler_b.step(average_val_loss_b)
 
         # Retrieve current learning rates for logging
         lr_f = forward_optimizer.param_groups[0]["lr"]
-        # lr_b = backward_optimizer.param_groups[0]["lr"]
 
         print(
             f"Epoch {epoch + 1:03d}/{epochs} | "
@@ -957,7 +1029,8 @@ def train() -> None:  # noqa: PLR0914, PLR0915
         if average_val_loss_f < best_val_loss_f:
             best_val_loss_f = average_val_loss_f
             torch.save(
-                forward_model.state_dict(), "data/15/best_chi_SIREN_forward_model-2.pth"
+                forward_model.state_dict(),
+                output_dir / "best_chi_SIREN_forward_model-FT-3.pth",
             )
             epochs_without_improvement = 0
         else:
@@ -969,8 +1042,13 @@ def train() -> None:  # noqa: PLR0914, PLR0915
 
     print("Training complete.")
 
-    torch.save(forward_model.state_dict(), "data/15/chi_SIREN_forward_model-2.pth")
-    # torch.save(backward_model.state_dict(), "data/15/chi_SIREN_backward_model.pth")
+    with Path(output_dir / "loss_history.json").open("w", encoding="utf-8") as f:
+        json.dump(loss_history, f, indent=4)
+    print(f"--> Saved metrics data to: {output_dir / 'loss_history.json'}")
+
+    plot_training_convergence(loss_history, output_dir / "convergence_curve.png")
+
+    torch.save(forward_model.state_dict(), "data/15/chi_SIREN_forward_model-FT-3.pth")
 
 
 def test() -> None:
@@ -1010,7 +1088,9 @@ def test() -> None:
 
     forward_model = ForwardCondSIRENStateModel().to(DEVICE)
     forward_model.load_state_dict(
-        torch.load("data/15/best_chi_SIREN_forward_model-2.pth", map_location=DEVICE),
+        torch.load(
+            "data/15/best_chi_SIREN_forward_model-FT-3.pth", map_location=DEVICE
+        ),
     )
     forward_model.eval()
 
@@ -1031,10 +1111,24 @@ def test() -> None:
         )
 
         channel_amp_dense = channel_amp_dense_batch[0]  # shape: (2, Nx, Ny, Nz)
-        stat_data = channel_amp_dense[0] + 1j * channel_amp_dense[1]
+        # 2. Combine channels into a complex tensor: Shape (Nx, Ny, Nz)
+        spatial_data_complex = torch.complex(channel_amp_dense[0], channel_amp_dense[1])
+
+        # 3. Return to Reciprocal Space (k-space)
+        # Step A: Shift zero-frequencies back to the corners along X (dim 0) and Y (dim 1)
+        unshifted_spatial = torch.fft.ifftshift(spatial_data_complex, dim=(0, 1))
+
+        # Step B: Perform 2D IFFT over X and Y
+        k_space_complex = torch.fft.ifft2(unshifted_spatial, dim=(0, 1))
+
+        # Step C: SCALE BACK! Multiply by (Nx * Ny) to counteract PyTorch's default 1/N normalization
+        k_space_complex *= 1
+
+        # 4. Transfer to NumPy for your physical State class
+        stat_data = k_space_complex.detach().cpu().numpy()
         preconditioned_pred_state = State(
             close_coupling_basis(condition.metadata).upcast(),
-            stat_data.detach().cpu().numpy(),
+            stat_data,
         )
 
     actual = get_scattering_state(
@@ -1044,6 +1138,15 @@ def test() -> None:
 
     preconditioned_state = get_preconditioned_state_from_state(
         actual, condition, n_channels=config.n_channels
+    )
+
+    actual_k_space_np = preconditioned_state.with_basis(
+        close_coupling_basis(condition.metadata)
+    ).raw_data.reshape(condition.metadata.shape)
+    actual_k_space = torch.from_numpy(actual_k_space_np).to(device=DEVICE)
+
+    actual_spatial_complex = torch.fft.fftshift(
+        torch.fft.fft2(actual_k_space, dim=(0, 1)), dim=(0, 1)
     )
 
     # Return the real and imaginary parts of the preconditioned state
@@ -1064,11 +1167,80 @@ def test() -> None:
     ax1.plot(z, precondtioned_pred_psi.real, label="Predicted real part")
     ax1.set_title("Actual and predicted scattering state")
     ax1.legend()
-    fig.savefig("/workspaces/multiscat_ml/data/15/scattering_state.png")
+    fig.savefig("data/15/scattering_state.png")
+
+    actual_s_matrix = get_scattering_matrix_from_preconditioned_state(
+        preconditioned_state, condition
+    )
+    predicted_s_matrix = get_scattering_matrix_from_preconditioned_state(
+        preconditioned_pred_state, condition
+    )
+
+    fig, ax, _mech = plot.array_against_axes_2d_k_nearest_neighbor(
+        actual_s_matrix, measure="abs"
+    )
+    ax.set_title("The actual scattering matrix")
+    fig.savefig("data/15/scattering_matrix_from_actual_state.png")
+
+    fig, ax, _mech = plot.array_against_axes_2d_k_nearest_neighbor(
+        predicted_s_matrix, measure="abs"
+    )
+    ax.set_title("The predicted scattering matrix")
+    fig.savefig("data/15/scattering_matrix_from_predicted_state.png")
+
+    # =====================================================================
+    # 1. Extract 1D Slices at the Center (x=0, y=0) as a function of z
+    # =====================================================================
+    center_x = Nx // 2
+    center_y = Ny // 2
+
+    # Get the 1D complex arrays along the Z-axis
+    pred_psi_z_complex = spatial_data_complex[center_x, center_y, :]
+    actual_psi_z_complex = actual_spatial_complex[center_x, center_y, :]
+
+    # Calculate absolute values (magnitudes) and convert to NumPy
+    pred_psi_z_abs = torch.abs(pred_psi_z_complex).cpu().numpy()
+    actual_psi_z_abs = torch.abs(actual_psi_z_complex).cpu().numpy()
+
+    # =====================================================================
+    # 2. Plotting the Real Space Amplitude Comparison
+    # =====================================================================
+    fig, ax1 = plot.get_figure()
+    ax1.set_xlabel("z", fontsize=11, fontweight="bold")
+    ax1.set_ylabel(
+        r"$|\psi(x=0, y=0, z)|$ (Real Space)", fontsize=11, fontweight="bold"
+    )
+
+    # Plot the absolute magnitudes
+    ax1.plot(
+        z, actual_psi_z_abs, label="Actual Amplitude", color="#1f77b4", linewidth=2
+    )
+    ax1.plot(
+        z,
+        pred_psi_z_abs,
+        label="Predicted Amplitude",
+        color="#ff7f0e",
+        linestyle="--",
+        linewidth=2,
+    )
+
+    ax1.set_title(
+        "Real Space Scattering Amplitude Profile down the Center Axis",
+        fontsize=12,
+        fontweight="bold",
+        pad=12,
+    )
+    ax1.legend(frameon=True, facecolor="white")
+
+    # Save to your directory
+    fig.savefig(
+        "data/15/scattering_amplitude_real_space.png", bbox_inches="tight", dpi=300
+    )
+    print("--> Real space 1D amplitude slice plot saved successfully.")
 
 
 if __name__ == "__main__":
-    RUN_GENERATE = False
+    RUN_GENERATE = True
     RUN_TRAIN = True
     RUN_TEST = True
 
