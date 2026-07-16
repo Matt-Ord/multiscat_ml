@@ -7,20 +7,8 @@ from typing import Any, override
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from scipy.constants import (  # type: ignore[import-untyped]
-    electron_volt,
-    physical_constants,
-)
-from slate_core.metadata import LobattoSpacedLengthMetadata
 from torch import nn, optim
 from tqdm import tqdm
-
-a = LobattoSpacedLengthMetadata
-# Constants
-HELIUM_MASS = physical_constants["alpha particle mass"][0]
-HELIUM_ENERGY = 20 * electron_volt * 10**-3
-Z_HEIGHT = 8
-Nx, Ny, Nz = 15, 15, 200
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -38,9 +26,9 @@ PARAMS_MAX = np.array(
     dtype=np.float64,
 )
 
-x = torch.linspace(-10, 10, 200)
-y = torch.linspace(-10, 10, 200)
-z = torch.linspace(-10, 10, 200)
+x = torch.linspace(-1, 1, 20)
+y = torch.linspace(-1, 1, 20)
+z = torch.linspace(-1, 1, 20)
 
 
 def denormalize_params(
@@ -115,7 +103,7 @@ class SirenLayer(nn.Module):
         in_features,
         out_features,
         is_first=False,
-        omega_0=5.0,
+        omega_0=30.0,
     ) -> None:
         super().__init__()
 
@@ -172,7 +160,7 @@ class FiLMSineLayer(nn.Module):
         out_features: int,
         cond_dim: int,
         is_first: bool = False,
-        omega_0: float = 5.0,
+        omega_0: float = 30.0,
     ) -> None:
         super().__init__()
         self.linear = nn.Linear(in_features, out_features)
@@ -226,10 +214,12 @@ class ForwardCondSIRENStateModel(nn.Module):
         hidden_dim: int = 64,
         output_dim: int = 1,
         num_siren_layers: int = 4,
-        first_omega_0: float = 5.0,
-        hidden_omega_0: float = 5.0,
+        first_omega_0: float = 30.0,
+        hidden_omega_0: float = 30.0,
     ) -> None:
         super().__init__()
+
+        self.hidden_omega_0 = hidden_omega_0
 
         self.condition_encoder = ConditionEncoder(
             param_dim=param_dim, cond_dim=cond_dim
@@ -258,14 +248,16 @@ class ForwardCondSIRENStateModel(nn.Module):
 
         self.siren_layers = nn.ModuleList(layers)
         self.head = nn.Linear(hidden_dim, output_dim)
+        self.init_head()
 
-    @override
+    def init_head(self) -> None:
+        with torch.no_grad():
+            bound = np.sqrt(6.0 / self.head.in_features) / self.hidden_omega_0
+            self.head.weight.uniform_(-bound, bound)
+            if self.head.bias is not None:
+                self.head.bias.zero_()
+
     def forward(self, params: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
-        """
-        params: (B, 3)
-        coords: (N_pts, 3)
-        returns: (B, N_pts, 1).
-        """
         B = params.shape[0]
         N = coords.shape[0]
 
@@ -280,28 +272,141 @@ class ForwardCondSIRENStateModel(nn.Module):
         for layer in self.siren_layers:
             x = layer(x, cond)
 
-        out = self.head(x)  # (B*N, 1)
+        out = self.head(x)
+        return out.view(B, N, 1)
+
+
+class PureSIREN(nn.Module):
+    """
+    Input:
+        params: (B, 3)   -> normalized kx, ky, kz in [0, 1] or standardized
+        coords: (N, 3)   -> x, y, z coordinates.
+
+    Output:
+        (B, N, 1)
+    """
+
+    def __init__(
+        self,
+        param_dim: int = 3,
+        coord_dim: int = 3,
+        hidden_dim: int = 128,
+        num_layers: int = 4,
+        first_omega_0: float = 30.0,
+        hidden_omega_0: float = 30.0,
+        output_dim: int = 1,
+    ) -> None:
+        super().__init__()
+
+        self.in_dim = param_dim + coord_dim
+        self.hidden_omega_0 = hidden_omega_0
+
+        layers = [
+            SirenLayer(
+                in_features=self.in_dim,
+                out_features=hidden_dim,
+                is_first=True,
+                omega_0=first_omega_0,
+            )
+        ]
+
+        layers.extend(
+            SirenLayer(
+                in_features=hidden_dim,
+                out_features=hidden_dim,
+                is_first=False,
+                omega_0=hidden_omega_0,
+            )
+            for _ in range(num_layers - 1)
+        )
+
+        self.net = nn.ModuleList(layers)
+        self.head = nn.Linear(hidden_dim, output_dim)
+        self.init_head()
+
+    def init_head(self) -> None:
+        with torch.no_grad():
+            bound = np.sqrt(6.0 / self.head.in_features) / self.hidden_omega_0
+            self.head.weight.uniform_(-bound, bound)
+            if self.head.bias is not None:
+                self.head.bias.zero_()
+
+    def forward(self, params: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        """
+        params: (B, 3)
+        coords: (N, 3)
+        returns: (B, N, 1).
+        """
+        B = params.shape[0]
+        N = coords.shape[0]
+
+        params_expanded = params[:, None, :].expand(B, N, -1)  # (B, N, 3)
+        coords_expanded = coords[None, :, :].expand(B, N, -1)  # (B, N, 3)
+
+        x = torch.cat([params_expanded, coords_expanded], dim=-1)  # (B, N, 6)
+        x = x.reshape(B * N, -1)
+
+        for layer in self.net:
+            x = layer(x)
+
+        out = self.head(x)
         return out.view(B, N, 1)
 
 
 class WavePhysicsLoss(nn.Module):
-    def __init__(self, eps=1e-8) -> None:
+    """
+    Loss for scalar fields.
+
+    Components
+    ----------
+    Relative L2:
+        ||u_pred - u|| / ||u||
+
+    Cosine similarity:
+        Encourages the predicted field to have the same global structure.
+
+    Amplitude loss (optional):
+        Wasserstein-style comparison of the value distributions.
+    """
+
+    def __init__(self, eps: float = 1e-8) -> None:
         super().__init__()
         self.eps = eps
-        self.cosine = nn.CosineSimilarity(dim=-1)  # Assumes flattened spatial grid
+        self.cosine = nn.CosineSimilarity(dim=1)
 
-    def forward(self, pred, target):
-        # 1. Relative L2 Loss (Captures balanced structural scaling)
-        diff_norm = torch.norm(pred - target, p=2, dim=-1)
-        target_norm = torch.norm(target, p=2, dim=-1)
-        rel_l2 = torch.mean(diff_norm / (target_norm + self.eps))
+    def forward(self, pred, target, alpha: float = 0.0):
+        # pred,target: (B,Nx,Ny,Nz)
 
-        # 2. Phase Alignment Loss (Ensures peaks and troughs line up horizontally)
-        # Cosine similarity outputs 1.0 for perfect alignment. We want to minimize (1 - similarity)
-        phase_loss = torch.mean(1.0 - self.cosine(pred, target))
+        B = pred.shape[0]
 
-        # Combined Loss (Balanced 50/50 split)
-        return rel_l2 + 1.0 * phase_loss
+        pred = pred.reshape(B, -1)
+        target = target.reshape(B, -1)
+
+        # ----------------------------------------------------
+        # Relative L2
+        # ----------------------------------------------------
+        diff_norm = torch.norm(pred - target, p=2, dim=1)
+        target_norm = torch.norm(target, p=2, dim=1)
+
+        rel_l2 = (diff_norm / (target_norm + self.eps)).mean()
+
+        # ----------------------------------------------------
+        # Global structural similarity
+        # ----------------------------------------------------
+        cosine_loss = (1.0 - self.cosine(pred, target)).mean()
+
+        if alpha == 0.0:
+            return rel_l2 + cosine_loss
+
+        # ----------------------------------------------------
+        # Distribution matching (Wasserstein approximation)
+        # ----------------------------------------------------
+        pred_sorted = torch.sort(torch.abs(pred), dim=1).values
+        target_sorted = torch.sort(torch.abs(target), dim=1).values
+
+        amplitude_loss = torch.mean(torch.abs(pred_sorted - target_sorted))
+
+        return rel_l2 + (1.0 - 0.5 * alpha) * cosine_loss + alpha * amplitude_loss
 
 
 def _sample_params_batch(rng: np.random.Generator, batch_size: int) -> np.ndarray:
@@ -452,15 +557,18 @@ def train() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     best_val_loss_f = float("inf")
-    patience = 150
+    patience = 600
     epochs_without_improvement = 0
-    epochs = 150
+    epochs = 600
+
+    switch_epoch = 40  # Start transitioning at epoch 40
+    ramp_duration = 30  # Linearly blend the amplitude loss over 30 epochs
 
     print(f"Using device: {DEVICE}")
 
-    train_batch_size = 64
+    train_batch_size = 16
     steps_per_epoch = 100
-    num_val_samples = 512
+    num_val_samples = 32
 
     rng_train = np.random.default_rng()
     rng_val = np.random.default_rng(12345)
@@ -484,14 +592,31 @@ def train() -> None:
     val_target_all = val_target_all.to(DEVICE)
 
     for epoch in range(epochs):
+        epoch_start = time.perf_counter()
         forward_model.train()
+        # Calculate dynamic alpha for stage routing
+        if epoch < switch_epoch:
+            alpha = 0
+        else:
+            # Smoothly scales alpha from 0.0 to 1.0 to prevent optimizer shock
+            alpha = min(1.0, (epoch - switch_epoch) / ramp_duration)
         train_loss_f = 0.0
 
-        pbar = tqdm(
-            range(steps_per_epoch), desc=f"Epoch {epoch + 1}/{epochs}", unit="batch"
+        current_lr = forward_optimizer.param_groups[0]["lr"]
+        print(
+            f"\n{'=' * 90}\n"
+            f"Epoch {epoch + 1:3d}/{epochs} | lr={current_lr:.2e} | "
+            f"best_val={best_val_loss_f:.6e} | patience={epochs_without_improvement}/{patience}\n"
+            f"{'=' * 90}"
         )
 
-        for _batch_idx in pbar:
+        pbar = tqdm(
+            range(steps_per_epoch),
+            desc=f"Epoch {epoch + 1}/{epochs}",
+            unit="batch",
+        )
+
+        for batch_idx in pbar:
             t0 = time.perf_counter()
 
             params_np = _sample_params_batch(rng_train, train_batch_size)
@@ -502,45 +627,68 @@ def train() -> None:
 
             forward_optimizer.zero_grad(set_to_none=True)
 
-            # Training forward pass: keep gradients on
             pred_flat = forward_model(params_batch, coords)  # (B, N_pts, 1)
             pred_batch = (
                 pred_flat[..., 0].contiguous().view(train_batch_size, Nx, Ny, Nz)
-            )  # (B, Nx, Ny, Nz)
+            )
 
-            loss_f = forward_criterion(pred_batch, target_batch)
+            loss_f = forward_criterion(pred_batch, target_batch, alpha)
             loss_f.backward()
 
-            torch.nn.utils.clip_grad_norm_(forward_model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                forward_model.parameters(),
+                max_norm=1.0,
+            )
             forward_optimizer.step()
 
             train_loss_f += loss_f.item()
+            running_loss = train_loss_f / (batch_idx + 1)
+
+            if batch_idx % 10 == 0:
+                print(
+                    f"  batch {batch_idx:03d}/{steps_per_epoch} | "
+                    f"loss={loss_f.item():.4e} | "
+                    f"avg={running_loss:.4e} | "
+                    f"pred_mean={pred_batch.mean().item():.3e} | "
+                    f"pred_std={pred_batch.std().item():.3e} | "
+                    f"tgt_std={target_batch.std().item():.3e} | "
+                    f"grad_norm={float(grad_norm):.3e} | "
+                    f"step_time={(time.perf_counter() - t0) * 1000:.1f} ms"
+                )
 
             pbar.set_postfix(
-                loss=f"{loss_f.item():.4e}",
-                ms=f"{(time.perf_counter() - t0) * 1000:.1f}",
+                loss=f"{loss_f.item():.3e}",
+                avg=f"{running_loss:.3e}",
+                lr=f"{current_lr:.1e}",
             )
 
         train_loss_f /= steps_per_epoch
         loss_history["train_loss"].append(train_loss_f)
 
-        # Validation
         forward_model.eval()
         with torch.no_grad():
             val_pred_flat = forward_model(val_params_all, coords)  # (V, N_pts, 1)
             val_pred = (
                 val_pred_flat[..., 0].contiguous().view(num_val_samples, Nx, Ny, Nz)
             )
-            val_loss_f = forward_criterion(val_pred, val_target_all).item()
+            val_loss_f = forward_criterion(val_pred, val_target_all, alpha).item()
 
         loss_history["val_loss"].append(val_loss_f)
         scheduler_f.step(val_loss_f)
 
+        new_lr = forward_optimizer.param_groups[0]["lr"]
+        epoch_time = time.perf_counter() - epoch_start
+
         print(
-            f"Epoch {epoch + 1:03d} | "
-            f"train_loss={train_loss_f:.4e} | "
-            f"val_loss={val_loss_f:.4e}"
+            f"Epoch {epoch + 1:03d} done | "
+            f"train_loss={train_loss_f:.6e} | "
+            f"val_loss={val_loss_f:.6e} | "
+            f"best_val={best_val_loss_f:.6e} | "
+            f"epoch_time={epoch_time:.2f} s"
         )
+
+        if new_lr != current_lr:
+            print(f"Learning rate reduced: {current_lr:.2e} -> {new_lr:.2e}")
 
         if val_loss_f < best_val_loss_f:
             best_val_loss_f = val_loss_f
@@ -553,10 +701,15 @@ def train() -> None:
                     "epoch": epoch,
                     "val_loss": val_loss_f,
                 },
-                output_dir / "best_test_forward_model.pt",
+                output_dir / "best_test_forward_model_2.pt",
             )
+            print("✓ New best model saved.")
         else:
             epochs_without_improvement += 1
+            print(
+                f"No improvement: {epochs_without_improvement}/{patience} "
+                f"epochs without progress"
+            )
 
         if epochs_without_improvement >= patience:
             print(f"Early stopping at epoch {epoch + 1}")
@@ -568,9 +721,9 @@ def train() -> None:
         json.dump(loss_history, f, indent=4)
     print(f"--> Saved metrics data to: {output_dir / 'loss_history.json'}")
 
-    plot_training_convergence(loss_history, output_dir / "convergence_curve_test.png")
+    plot_training_convergence(loss_history, output_dir / "convergence_curve_test_2.png")
 
-    torch.save(forward_model.state_dict(), "data/15/test_model.pth")
+    torch.save(forward_model.state_dict(), "data/15/test_model_2.pth")
 
 
 def test() -> None:
@@ -598,9 +751,9 @@ def test() -> None:
     # 2. Build a fresh test grid
     # ------------------------------------------------------------------
     Nx, Ny, Nz = 160, 160, 200
-    x_grid = np.linspace(-10.0, 10.0, Nx, dtype=np.float32)
-    y_grid = np.linspace(-10.0, 10.0, Ny, dtype=np.float32)
-    z_grid = np.linspace(-10.0, 10.0, Nz, dtype=np.float32)
+    x_grid = np.linspace(-1.0, 1.0, Nx, dtype=np.float32)
+    y_grid = np.linspace(-1.0, 1.0, Ny, dtype=np.float32)
+    z_grid = np.linspace(-1.0, 1.0, Nz, dtype=np.float32)
 
     X, Y, Z = torch.meshgrid(
         torch.from_numpy(x_grid),
@@ -631,7 +784,7 @@ def test() -> None:
     ).to(DEVICE)
 
     forward_model.load_state_dict(
-        torch.load("data/15/best_test_forward_model.pt", map_location=DEVICE)[
+        torch.load("data/15/best_test_forward_model_2.pt", map_location=DEVICE)[
             "model_state_dict"
         ]
     )
@@ -640,7 +793,12 @@ def test() -> None:
     # ------------------------------------------------------------------
     # 4. Ground truth and prediction
     # ------------------------------------------------------------------
-    actual_field = simulate_function(params_norm, x_grid, y_grid, z_grid)
+    actual_field = simulate_function(
+        params_norm,
+        torch.from_numpy(x_grid),
+        torch.from_numpy(y_grid),
+        torch.from_numpy(z_grid),
+    )
 
     with torch.no_grad():
         param_tensor = torch.tensor(
@@ -719,7 +877,7 @@ def test() -> None:
 
     plt.tight_layout()
     fig.savefig(
-        "data/15/simple_field_prediction_test.png", bbox_inches="tight", dpi=300
+        "data/15/simple_field_prediction_test_2.png", bbox_inches="tight", dpi=300
     )
 
     print("--> Simple field comparison plot saved successfully.")
