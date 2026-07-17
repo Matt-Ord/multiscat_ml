@@ -33,8 +33,12 @@ elif torch.backends.mps.is_available():
 else:
     DEVICE = torch.device("cpu")  # pyright: ignore[reportConstantRedefinition]
 
-PARAMS_MIN = np.array([5.0, 0.5, 2.0, 0.05, 2, 0.0], dtype=np.float64)
-PARAMS_MAX = np.array([10.0, 1.5, 4.0, 0.20, 3.5, np.pi / 2], dtype=np.float64)
+PARAMS_MIN = np.array(
+    [5.0, 0.5, 2.0, 0.05, 2.5, 2.5, 2.5, 2.5, 0.0, 0.0, 0.0], dtype=np.float64
+)
+PARAMS_MAX = np.array(
+    [10.0, 1.5, 4.0, 0.20, 5, 5, 5, 5, np.pi / 2, np.pi / 2, 60], dtype=np.float64
+)
 
 
 def denormalize_params(
@@ -48,8 +52,10 @@ def condition_from_params(
     params: np.ndarray[tuple[int], np.dtype[np.float64]],
 ) -> MorseScatteringCondition:
     """Convert a tensor of parameters into a ScatteringCondition."""
-    depth, height, offset, beta, unit_cell, theta = denormalize_params(
-        params,
+    depth, height, offset, beta, a1x, a1y, a2x, a2y, theta, phi, energy = (
+        denormalize_params(
+            params,
+        )
     )
 
     morse_params = operator.build.CorrugatedMorseParameters(
@@ -61,8 +67,8 @@ def condition_from_params(
 
     metadata = scattering_metadata_from_stacked_delta_x(
         (
-            np.array([unit_cell * angstrom_si, 0, 0]),
-            np.array([0, unit_cell * angstrom_si, 0]),
+            np.array([a1x * angstrom_si, a1y * angstrom_si, 0]),
+            np.array([a2x * angstrom_si, a2y * angstrom_si, 0]),
             np.array([0, 0, Z_HEIGHT * angstrom_si]),
         ),
         (15, 15, 200),
@@ -74,8 +80,8 @@ def condition_from_params(
         metadata=metadata,
         incident_k=momentum_from_angles(
             theta=theta,
-            phi=np.deg2rad(0),
-            energy=HELIUM_ENERGY,
+            phi=phi,
+            energy=energy * electron_volt * 10**-3,
             mass=HELIUM_MASS,
         ),
     )
@@ -92,8 +98,22 @@ def params_from_condition(
     condition: MorseScatteringCondition,
 ) -> np.ndarray[tuple[int], np.dtype[np.float64]]:
     """Extract the parameters from a ScatteringCondition."""
-    metadata_x01, _ = split_scattering_metadata(condition.metadata)
-    unit_cell = metadata_x01.children[0].delta / angstrom_si
+    metadata_xy, _ = split_scattering_metadata(condition.metadata)
+
+    # Recover 2D lattice vectors in Angstrom
+    a1 = (
+        metadata_xy.extra.vectors[0][:2]
+        * metadata_xy.children[0].domain.delta
+        / angstrom_si
+    )
+    a2 = (
+        metadata_xy.extra.vectors[1][:2]
+        * metadata_xy.children[1].domain.delta
+        / angstrom_si
+    )
+
+    a1x, a1y = a1
+    a2x, a2y = a2
 
     morse_parameters = condition.morse_parameters
 
@@ -103,8 +123,12 @@ def params_from_condition(
     beta = morse_parameters.beta
 
     theta = condition.theta
+    phi = condition.phi
+    energy = condition.incident_energy / (electron_volt * 10**-3)
 
-    return normalize_params(np.array([depth, height, offset, beta, unit_cell, theta]))
+    return normalize_params(
+        np.array([depth, height, offset, beta, a1x, a1y, a2x, a2y, theta, phi, energy])
+    )
 
 
 def simulate_s_matrix(
@@ -184,18 +208,28 @@ class ResBlock(nn.Module):
         return self.act(x + self.net(x))
 
 
+class SpecularInitLinear(nn.Linear):
+    def reset_parameters(self) -> None:
+        # Directly initialize to the desired map:
+        # W = 0, b = [1, 0, 0, ..., 0]
+        nn.init.zeros_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+            self.bias.data[0] = 1.0
+
+
 class ForwardModel(nn.Module):
-    """Predicts S-matrix (15x15) from 6 parameters using a deep ResNet."""
+    """Predicts S-matrix (15x15) from 11 parameters using a deep ResNet."""
 
     def __init__(
         self,
-        input_dim: int = 6,
+        input_dim: int = 11,
         hidden_dim: int = 512,
         output_dim: int = 15 * 15,
     ) -> None:
         super().__init__()
 
-        # 1. Expand the 6 parameters into a high-dimensional space
+        # 1. Expand the 11 parameters into a high-dimensional space
         self.embedding = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -212,10 +246,19 @@ class ForwardModel(nn.Module):
         )
 
         # 3. Collapse back down to the 225 (15x15) S-matrix
-        self.head = nn.Sequential(
-            nn.Linear(hidden_dim, output_dim),
-            nn.LeakyReLU(negative_slope=0.01),
-        )
+        SPECULAR = False
+
+        if SPECULAR:
+            self.output_linear = SpecularInitLinear(hidden_dim, output_dim)
+            self.head = nn.Sequential(
+                self.output_linear,
+                nn.LeakyReLU(negative_slope=0.01),
+            )
+        else:
+            self.head = nn.Sequential(
+                nn.Linear(hidden_dim, output_dim),
+                nn.LeakyReLU(negative_slope=0.01),
+            )
 
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -226,7 +269,7 @@ class ForwardModel(nn.Module):
 
 
 class BackwardModel(nn.Module):
-    """Predicts 6 parameters from S-matrix (15x15)."""
+    """Predicts 11 parameters from S-matrix (15x15)."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -240,7 +283,7 @@ class BackwardModel(nn.Module):
             nn.Linear(256, 128),
             nn.LayerNorm(128),
             nn.GELU(),
-            nn.Linear(128, 6),
+            nn.Linear(128, 11),
             nn.Sigmoid(),  # Forces output to be [0, 1]
         )
 
@@ -253,6 +296,7 @@ class BackwardModel(nn.Module):
 
 def generate_dataset_hdf5(filepath: Path, num_samples: int = 1000) -> None:
     """Generate parameters and S-matrices, saving them directly to disk."""
+    filepath.parent.mkdir(parents=True, exist_ok=True)
     if filepath.exists():
         print(f"Dataset already exists at {filepath}. Skipping generation.")
         return
@@ -265,7 +309,7 @@ def generate_dataset_hdf5(filepath: Path, num_samples: int = 1000) -> None:
     # Open an HDF5 file in write mode
     with h5py.File(filepath, "w") as f:
         # Create empty datasets on disk
-        input_data = f.create_dataset("X", shape=(num_samples, 6), dtype=np.float64)  # type: ignore[hd5]
+        input_data = f.create_dataset("X", shape=(num_samples, 11), dtype=np.float64)  # type: ignore[hd5]
         output_data = f.create_dataset(  # type: ignore[hd5]
             "Y",
             shape=(num_samples, 15, 15),
@@ -273,7 +317,8 @@ def generate_dataset_hdf5(filepath: Path, num_samples: int = 1000) -> None:
         )
 
         for i in range(num_samples):
-            params = rng.uniform(size=6)
+            print(f"Generating sample {i + 1}/{num_samples}")
+            params = rng.uniform(size=11)
 
             input_data[i] = params
             output_data[i] = simulate_s_matrix(params)
@@ -340,7 +385,7 @@ def generate() -> None:
 def load_datasets() -> ConcatDataset[tuple[torch.Tensor, torch.Tensor]]:
     datasets = [
         HDF5ScatteringDataset(Path(f"data/15/scattering_dataset.{i}.hdf5"))
-        for i in range(50)
+        for i in range(9)
     ]
     return ConcatDataset[tuple[torch.Tensor, torch.Tensor]](datasets)
 
@@ -574,13 +619,15 @@ def test() -> None:
         morse_parameters=operator.build.CorrugatedMorseParameters(
             depth=7.63 * electron_volt * 10**-3,
             height=(1.0 / 1.1) * angstrom_si,
-            offset=3.0 * angstrom_si,
-            beta=0.10,
+            offset=1.0 * angstrom_si,
+            beta=0.05,
         ),
         metadata=scattering_metadata_from_stacked_delta_x(
             (
-                np.array([2.84 * angstrom_si, 0, 0]),
-                np.array([0, 2.84 * angstrom_si, 0]),
+                np.array([8 * angstrom_si / np.sqrt(2), 0, 0]),
+                np.array(
+                    [8 * angstrom_si / np.sqrt(8), 8 * angstrom_si * np.sqrt(3 / 8), 0]
+                ),
                 np.array([0, 0, Z_HEIGHT * angstrom_si]),
             ),
             (15, 15, 200),
@@ -597,6 +644,7 @@ def test() -> None:
         params_from_condition(condition),
         dtype=torch.float32,
     ).unsqueeze(0)  # Add batch dimension
+
     forward_model = ForwardModel().to(DEVICE)
     forward_model.load_state_dict(
         torch.load("data/15/forward_model.pth", map_location=DEVICE),
@@ -610,7 +658,9 @@ def test() -> None:
             AsUpcast(basis.transformed_from_metadata(metadata_x01), metadata_x01),
             channel_intensity_dense.detach().cpu().numpy().astype(np.complex128),
         )
-    fig, ax, _mesh = plot.array_against_axes_2d_k(predicted, measure="abs")
+    fig, ax, _mesh = plot.array_against_axes_2d_k_nearest_neighbor(
+        predicted, measure="abs"
+    )
     ax.set_title("Predicted scattering matrix")
     fig.savefig("data/15/predicted_scattering_matrix.png")
 
@@ -620,19 +670,83 @@ def test() -> None:
         backend="scipy",
     )
 
-    fig, ax, _mesh = plot.array_against_axes_2d_k(actual - predicted, measure="abs")
+    fig, ax, _mesh = plot.array_against_axes_2d_k_nearest_neighbor(
+        actual - predicted, measure="abs"
+    )
     fig.savefig("data/15/error_scattering_matrix.png")
 
     print(format_intensity_map(predicted, threshold=1e-6))
     print("error intensity map:")
     print(format_intensity_map(actual - predicted, threshold=1e-6))
+    error = actual - predicted
+    print(np.sum(np.abs(error.raw_data)))
 
-    fig, ax, _mesh = plot.array_against_axes_2d_k(actual, measure="abs")
+    fig, ax, _mesh = plot.array_against_axes_2d_k_nearest_neighbor(
+        actual, measure="abs"
+    )
     ax.set_title("The actual scattering matrix")
     fig.savefig("data/15/actual_scattering_matrix.png")
 
 
+def run_model() -> None:
+    # Load the trained forward model
+    forward_model = ForwardModel().to(DEVICE)
+    forward_model.load_state_dict(
+        torch.load("data/15/forward_model.pth", map_location=DEVICE),
+    )
+    forward_model.eval()
+
+    # Example: Predict scattering matrix for a new set of parameters
+    condition = MorseScatteringCondition(
+        mass=HELIUM_MASS,
+        morse_parameters=operator.build.CorrugatedMorseParameters(
+            depth=7.63 * electron_volt * 10**-3,
+            height=(1.0 / 1.1) * angstrom_si,
+            offset=1.0 * angstrom_si,
+            beta=0.05,
+        ),
+        metadata=scattering_metadata_from_stacked_delta_x(
+            (
+                np.array([8 * angstrom_si / np.sqrt(2), 0, 0]),
+                np.array(
+                    [8 * angstrom_si / np.sqrt(8), 8 * angstrom_si * np.sqrt(3 / 8), 0]
+                ),
+                np.array([0, 0, Z_HEIGHT * angstrom_si]),
+            ),
+            (15, 15, 200),
+        ),
+        incident_k=momentum_from_angles(
+            theta=np.deg2rad(30),
+            phi=np.deg2rad(0),
+            energy=HELIUM_ENERGY,
+            mass=HELIUM_MASS,
+        ),
+    )
+
+    test_params = torch.tensor(
+        params_from_condition(condition),
+        dtype=torch.float32,
+    ).unsqueeze(0)  # Add batch dimension
+
+    with torch.no_grad():
+        predicted_s_matrix = forward_model(test_params)
+
+    print("Predicted S-matrix:")
+    print(predicted_s_matrix.cpu().numpy())
+
+
 if __name__ == "__main__":
-    generate()
-    train()
-    test()
+    RUN_GENERATE = False
+    RUN_TRAIN = False
+    RUN_TEST = True
+    RUN_MODEL = False
+
+    if RUN_GENERATE:
+        generate()
+    if RUN_TRAIN:
+        train()
+    if RUN_TEST:
+        test()
+    if RUN_MODEL:
+        run_model()
+1

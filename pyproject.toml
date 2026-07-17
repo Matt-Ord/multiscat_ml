@@ -41,6 +41,7 @@ ignore = [
     "DOC201",
     "DOC402",
     "PD",
+    "ERA001",
 ]
 fixable = ["ALL"]
 unfixable = ["T201"]
