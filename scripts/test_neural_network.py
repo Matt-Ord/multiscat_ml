@@ -21,7 +21,7 @@ else:
 _BOUNDS = {
     "x": (-4.0, 4.0),
     "y": (-4.0, 4.0),
-    "z": (-4.0, 6.0),
+    "z": (-4.0, 8.0),
     "kx": (-4.0, 4.0),
     "ky": (-4.0, 4.0),
     "kz": (-4.0, 4.0),
@@ -413,6 +413,102 @@ class PureMLP(nn.Module):
         return self.head(x)
 
 
+# TODO: we haven't considered the fact that the
+# region of oscillation depends on both (kx, ky, kz)
+# and on the channel idx
+class ExplicitAsymptoticGaborNet(nn.Module):
+    """
+    Parameter-Agnostic Neural Representation.
+
+    Learns non-zero asymptotic limits (z -> +infty) and localized transient
+    oscillations without assuming prior knowledge of which parameters (kx, ky, kz)
+    govern the zero-point or transition window.
+
+    Inputs:
+        x: Tensor of shape (B, 6) -> [x, y, z, kx, ky, kz]
+    """
+
+    def __init__(
+        self,
+        in_dim: int = 6,
+        param_dim: int = 3,  # [kx, ky, kz]
+        hidden_dim: int = 128,
+        omega_0: float = 3.0,
+        sigma_0: float = 1.5,
+        output_dim: int = 1,
+    ) -> None:
+        super().__init__()
+
+        # 1. Persistent 2D Stream: Inputs are [x, y, kx, ky, kz] (5 features, NO z)
+        self.persistent_net = nn.Sequential(
+            SirenLayer(
+                in_features=2 + param_dim,
+                out_features=hidden_dim,
+                is_first=True,
+                omega_0=omega_0,
+            ),
+            SirenLayer(
+                in_features=hidden_dim,
+                out_features=hidden_dim,
+                is_first=False,
+                omega_0=omega_0,
+            ),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+        # 2. Fully Parameter-Agnostic z-Gate: Inputs are [z, kx, ky, kz] (1 + param_dim features)
+        self.z_gate = nn.Sequential(
+            nn.Linear(1 + param_dim, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+
+        # 3. Localized Transient Gabor Stream
+        self.freq_linear = nn.Linear(in_dim, hidden_dim)
+        # Envelope takes [z, kx, ky, kz] to allow any parameter to scale/shift the Gabor window
+        self.envelope_linear = nn.Linear(1 + param_dim, hidden_dim)
+        self.transient_head = nn.Linear(hidden_dim, output_dim)
+
+        self.omega_0 = omega_0
+        self.sigma_0 = sigma_0
+        self.init_weights()
+
+    def init_weights(self) -> None:
+        with torch.no_grad():
+            bound = np.sqrt(6.0 / self.freq_linear.in_features) / self.omega_0
+            self.freq_linear.weight.uniform_(-bound, bound)
+            self.freq_linear.bias.uniform_(-bound, bound)
+
+            nn.init.normal_(self.envelope_linear.weight, std=0.1)
+            nn.init.zeros_(self.envelope_linear.bias)
+
+    @override
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Deconstruct inputs: x[:, :2] -> [x, y], x[:, 2:3] -> [z], x[:, 3:] -> [kx, ky, kz]
+        z = x[:, 2:3]
+        params = x[:, 3:]  # [kx, ky, kz]
+
+        # A. Spatial 2D inputs for persistent waves: [x, y, kx, ky, kz]
+        spatial_inputs = torch.cat([x[:, :2], params], dim=-1)
+        c_persistent = self.persistent_net(spatial_inputs)
+
+        # B. Combined z-parameter vector: [z, kx, ky, kz]
+        z_and_params = torch.cat([z, params], dim=-1)
+
+        # C. Parameter-Agnostic Gate: Learns switch behavior for any mode combination
+        gate = torch.sigmoid(self.z_gate(z_and_params))
+
+        # D. Localized Transient Gabor Stream
+        freq = self.omega_0 * self.freq_linear(x)
+        envelope = self.sigma_0 * self.envelope_linear(z_and_params)
+
+        gabor_feats = torch.sin(freq) * torch.exp(-0.5 * (envelope**2))
+        y_transient = self.transient_head(gabor_feats)
+
+        # Output = Asymptotic Plateau + Localized Oscillations
+        return gate * c_persistent + y_transient
+
+
 def _make_pred_batch(forward_model, params_batch_np, coords):
     """
     params_batch_np: (B, param_dim) numpy array
@@ -741,7 +837,7 @@ def _load_best_models(
 
 
 if __name__ == "__main__":
-    RUN_TRAIN = False
+    RUN_TRAIN = True
     RUN_TEST = True
     LOAD_CHECKPOINTS = True
 
@@ -753,6 +849,13 @@ if __name__ == "__main__":
             param_dim=6, output_dim=1, first_omega_0=1.0, hidden_omega_0=1.0
         ),
         "PlainMLP": PureMLP(param_dim=6, output_dim=1),
+        "ExplicitAsymptoticGaborNet": ExplicitAsymptoticGaborNet(
+            in_dim=6,
+            hidden_dim=128,
+            omega_0=3.0,
+            sigma_0=1.5,
+            output_dim=1,
+        ),
     }
     if LOAD_CHECKPOINTS:
         _load_best_models(model_zoo=model_zoo, base_path=Path("data/15"))
@@ -767,8 +870,13 @@ if __name__ == "__main__":
                 output_dir=Path(f"data/15/{name}"),
             )
     if RUN_TEST:
+        sample = _generate_parameters(n_samples=1).squeeze(1).cpu()
+
+        # Extract (x, y) coordinates and (kx, ky, kz) parameters
+        rand_coords = (sample[0].item(), sample[1].item())
+        rand_params = (sample[3].item(), sample[4].item(), sample[5].item())
         compare_models_against_z(
             model_zoo=model_zoo,
-            coordinates=(1, 1),
-            parameters=(2.0, 2.0, 2.0),
+            coordinates=rand_coords,
+            parameters=rand_params,
         )
