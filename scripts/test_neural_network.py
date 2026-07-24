@@ -21,7 +21,7 @@ else:
 _BOUNDS = {
     "x": (-4.0, 4.0),
     "y": (-4.0, 4.0),
-    "z": (-4.0, 4.0),
+    "z": (-4.0, 6.0),
     "kx": (-4.0, 4.0),
     "ky": (-4.0, 4.0),
     "kz": (-4.0, 4.0),
@@ -34,7 +34,7 @@ def _test_function(params: torch.Tensor) -> torch.Tensor:
     # Fundamental spatial frequency for domain [-4, 4] (period = 8)
 
     z_start = -2.0 + 0.2 * kz  # Region where function departs from 0 (around z = -2)
-    z_flat = 3.5 + 0.3 * kz  # Plateau region where it flattens out (z = 3.5 to 5)
+    z_flat = 3.25 + 0.25 * kz  # Plateau region where it flattens out (z = 3.5 to 5)
     width = z_flat - z_start
     z_mid = 0.5 * (z_start + z_flat)
 
@@ -45,7 +45,10 @@ def _test_function(params: torch.Tensor) -> torch.Tensor:
 
     # 3. Fourier Spatial Channels
     w0 = torch.pi / 4.0
-    c_persistent = asymptote * (0.5 * torch.cos(w0 * x) * torch.cos(w0 * y))
+    c_persistent = asymptote * (
+        0.5 * torch.cos(w0 * x) * torch.cos(w0 * y)
+        + 0.5 * torch.cos(w0 * x + 0.21) * torch.cos(2.0 * w0 * y - 0.31)
+    )
     c_decaying = torch.sin(2.0 * w0 * x) + torch.cos(2.0 * w0 * y)
 
     # 4. Multiplicative z-Oscillation Factor
@@ -56,7 +59,7 @@ def _test_function(params: torch.Tensor) -> torch.Tensor:
     ) * torch.cos(w0 * y)
 
     # Combine channels with multiplicative oscillation
-    open_channel = sigma * c_persistent * (1.0 - envelope * raw_z_oscillation)
+    open_channel = (sigma) * c_persistent * (1.0 - envelope * raw_z_oscillation)
     transient_channel = envelope * 0.5 * c_decaying
 
     return torch.sigmoid(4.0 * (z - z_start)) * (open_channel + transient_channel)
@@ -663,9 +666,9 @@ def compare_models_against_z(
     """Plot and compares ground truth target vs predictions from multiple models along the z-axis."""
     delta_z = _BOUNDS["z"][1] - _BOUNDS["z"][0]
     z_points = torch.linspace(
-        _BOUNDS["z"][0] - 0.2 * delta_z,
-        _BOUNDS["z"][1] + 0.2 * delta_z,
-        100,
+        _BOUNDS["z"][0] - 0.5 * delta_z,
+        _BOUNDS["z"][1] + 0.5 * delta_z,
+        500,
         device=DEVICE,
     )
 
@@ -715,6 +718,9 @@ def compare_models_against_z(
     )
     ax.legend(frameon=True, facecolor="white", edgecolor="none")
     ax.set_xlim(z_np[0], z_np[-1])
+
+    ax.axvline(x=_BOUNDS["z"][0], color="gray", linewidth=2.0)
+    ax.axvline(x=_BOUNDS["z"][1], color="gray", linewidth=2.0)
     fig.savefig(
         "data/15/model_comparison_vs_z.png",
         bbox_inches="tight",
@@ -735,6 +741,10 @@ def _load_best_models(
 
 
 if __name__ == "__main__":
+    RUN_TRAIN = False
+    RUN_TEST = True
+    LOAD_CHECKPOINTS = True
+
     model_zoo: dict[str, nn.Module] = {
         "PureSIREN": PureSIREN(
             param_dim=6, output_dim=1, first_omega_0=1.0, hidden_omega_0=1.0
@@ -744,12 +754,6 @@ if __name__ == "__main__":
         ),
         "PlainMLP": PureMLP(param_dim=6, output_dim=1),
     }
-
-    # Execution flags
-    RUN_TRAIN = True
-    RUN_TEST = True
-    LOAD_CHECKPOINTS = False
-
     if LOAD_CHECKPOINTS:
         _load_best_models(model_zoo=model_zoo, base_path=Path("data/15"))
 
@@ -765,6 +769,6 @@ if __name__ == "__main__":
     if RUN_TEST:
         compare_models_against_z(
             model_zoo=model_zoo,
-            coordinates=(1.0, 1.0),
+            coordinates=(1, 1),
             parameters=(2.0, 2.0, 2.0),
         )
