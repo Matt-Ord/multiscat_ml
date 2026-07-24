@@ -29,8 +29,37 @@ _BOUNDS = {
 
 
 def _test_function(params: torch.Tensor) -> torch.Tensor:
-    x, y, z, kx, ky, kz = params
-    return torch.sin(kx * x) * torch.sin(ky * y) * torch.sin(kz * z)
+    x, y, z, asymptote, ky, kz = params
+
+    # Fundamental spatial frequency for domain [-4, 4] (period = 8)
+
+    z_start = -2.0 + 0.2 * kz  # Region where function departs from 0 (around z = -2)
+    z_flat = 3.5 + 0.3 * kz  # Plateau region where it flattens out (z = 3.5 to 5)
+    width = z_flat - z_start
+    z_mid = 0.5 * (z_start + z_flat)
+
+    # 2. Transition Envelopes
+    gamma = 1.0 + 0.2 * torch.nn.functional.softplus(ky)
+    sigma = torch.sigmoid((6.0 / width) * gamma * (z - z_mid))
+    envelope = torch.exp(-6.0 * ((z - z_mid) / width) ** 2)
+
+    # 3. Fourier Spatial Channels
+    w0 = torch.pi / 4.0
+    c_persistent = asymptote * (0.5 * torch.cos(w0 * x) * torch.cos(w0 * y))
+    c_decaying = torch.sin(2.0 * w0 * x) + torch.cos(2.0 * w0 * y)
+
+    # 4. Multiplicative z-Oscillation Factor
+    raw_z_oscillation = 2.5 * torch.cos(
+        8.0 * torch.pi * (z - z_start) / width
+    ) + 1.5 * torch.sin(3.0 * torch.pi * (z - z_start) / width) * torch.sin(
+        w0 * x
+    ) * torch.cos(w0 * y)
+
+    # Combine channels with multiplicative oscillation
+    open_channel = sigma * c_persistent * (1.0 - envelope * raw_z_oscillation)
+    transient_channel = envelope * 0.5 * c_decaying
+
+    return torch.sigmoid(4.0 * (z - z_start)) * (open_channel + transient_channel)
 
 
 def _generate_parameters(n_samples: int) -> torch.Tensor:
@@ -51,7 +80,7 @@ def _generate_dataset(n_samples: int) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 @contextlib.contextmanager
-def freeze_parameters(model: nn.Module) -> Any:  # noqa: ANN401
+def freeze_parameters(model: nn.Module) -> Any:  # ruff: ignore[any-type]
     """Temporarily disables gradient computation for a model's parameters."""
     # Save the original requires_grad state for each parameter
     original_states = {param: param.requires_grad for param in model.parameters()}
@@ -632,7 +661,13 @@ def compare_models_against_z(
     parameters: tuple[float, float, float] = (2.0, 2.0, 2.0),
 ) -> None:
     """Plot and compares ground truth target vs predictions from multiple models along the z-axis."""
-    z_points = torch.linspace(_BOUNDS["z"][0], _BOUNDS["z"][1], 100, device=DEVICE)
+    delta_z = _BOUNDS["z"][1] - _BOUNDS["z"][0]
+    z_points = torch.linspace(
+        _BOUNDS["z"][0] - 0.2 * delta_z,
+        _BOUNDS["z"][1] + 0.2 * delta_z,
+        100,
+        device=DEVICE,
+    )
 
     # 1. Compute ground truth
     _, targets = get_target_against_z(
@@ -679,12 +714,24 @@ def compare_models_against_z(
         fontweight="bold",
     )
     ax.legend(frameon=True, facecolor="white", edgecolor="none")
-
+    ax.set_xlim(z_np[0], z_np[-1])
     fig.savefig(
         "data/15/model_comparison_vs_z.png",
         bbox_inches="tight",
         dpi=300,
     )
+
+
+def _load_best_models(
+    model_zoo: dict[str, nn.Module], base_path: Path = Path("data/15")
+) -> None:
+    """Load the best model checkpoints from disk into the provided model zoo."""
+    for name, model in model_zoo.items():
+        ckpt_path = base_path / name / "best_model.pth"
+        if ckpt_path.exists():
+            checkpoint = torch.load(ckpt_path, map_location=DEVICE)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            print(f"✓ Loaded trained weights for {name} from {ckpt_path}")
 
 
 if __name__ == "__main__":
@@ -701,7 +748,10 @@ if __name__ == "__main__":
     # Execution flags
     RUN_TRAIN = True
     RUN_TEST = True
-    RUN_COMPARISON = True
+    LOAD_CHECKPOINTS = False
+
+    if LOAD_CHECKPOINTS:
+        _load_best_models(model_zoo=model_zoo, base_path=Path("data/15"))
 
     # 1. Train Models Generic Loop
     if RUN_TRAIN:
@@ -713,16 +763,6 @@ if __name__ == "__main__":
                 output_dir=Path(f"data/15/{name}"),
             )
     if RUN_TEST:
-        for name, model in model_zoo.items():
-            ckpt_path = Path(f"data/15/{name}/best_model.pth")
-            if ckpt_path.exists():
-                checkpoint = torch.load(ckpt_path, map_location=DEVICE)
-                model.load_state_dict(checkpoint["model_state_dict"])
-                print(f"✓ Loaded trained weights for {name} from {ckpt_path}")
-            else:
-                print(
-                    f"⚠️ Warning: No checkpoint found at {ckpt_path}. Using random weights!"
-                )
         compare_models_against_z(
             model_zoo=model_zoo,
             coordinates=(1.0, 1.0),
