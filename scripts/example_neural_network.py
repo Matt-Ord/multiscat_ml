@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import override
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from slate_core.plot import get_figure
@@ -682,12 +681,7 @@ def compare_models_against_z(
         coordinates=coordinates, parameters=parameters, z_points=z_points
     )
 
-    plt.style.use(
-        "seaborn-v0_8-whitegrid"
-        if "seaborn-v0_8-whitegrid" in plt.style.available
-        else "default"
-    )
-    fig, ax = plt.subplots(figsize=(10, 5), dpi=300)
+    fig, ax = get_figure()
 
     z_np = z_points.cpu().numpy()
     ax.plot(
@@ -708,14 +702,10 @@ def compare_models_against_z(
         )
         ax.plot(z_np, predictions.cpu().numpy(), label=f"Pred: {name}", linestyle="--")
 
-    ax.set_xlabel("z", fontsize=12, fontweight="bold")
-    ax.set_ylabel("f(x, y, z, kx, ky, kz)", fontsize=12, fontweight="bold")
-    ax.set_title(
-        f"Model Comparison vs z-axis\n(x={coordinates[0]}, y={coordinates[1]}, kx={parameters[0]}, ky={parameters[1]}, kz={parameters[2]})",
-        fontsize=13,
-        fontweight="bold",
-    )
-    ax.legend(frameon=True, facecolor="white", edgecolor="none")
+    ax.set_xlabel("z")
+    ax.set_ylabel("f(x, y, z, kx, ky, kz)")
+    ax.set_title("Model Comparison vs z-axis")
+    ax.legend()
     ax.set_xlim(z_np[0], z_np[-1])  # cspell: disable-line
 
     ax.axvline(x=_BOUNDS["z"][0], color="gray", linewidth=2.0)  # cspell: disable-line
