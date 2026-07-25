@@ -821,9 +821,7 @@ if __name__ == "__main__":
         if (entry.base_path / "training_stats.pkl").exists():
             stats = TrainingStats.load(entry.base_path / "training_stats.pkl")
             fig, ax = plot_loss_curves(stats)
-            fig.savefig(
-                entry.base_path / "loss_curves.png", bbox_inches="tight", dpi=300
-            )
+            fig.savefig(entry.base_path / "loss_curves.pdf")
 
     compare_model_validation_loss(model_zoo=model_zoo)
     compare_models_against_z(model_zoo=model_zoo)

@@ -184,11 +184,13 @@ def plot_loss_curves(
         The figure and axes containing the plotted loss curves.
     """
     fig, ax_res = get_figure(ax)
+
     plot_training_loss(stats, ax=ax_res)
     plot_validation_loss(stats, ax=ax_res)
+
     ax_res.set_yscale("log")
-    ax_res.set_xlabel("Epochs", fontsize=12, fontweight="bold")
-    ax_res.set_ylabel("Loss (Log Scale)", fontsize=12, fontweight="bold")
-    ax_res.set_title("Training and Validation Loss", fontsize=13, fontweight="bold")
-    ax_res.legend(frameon=True, facecolor="white", edgecolor="none")
+    ax_res.set_xlabel("Epochs")
+    ax_res.set_ylabel("Loss (Log Scale)")
+    ax_res.set_title("Training and Validation Loss")
+    ax_res.legend()
     return fig, ax_res
