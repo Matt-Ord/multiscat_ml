@@ -52,5 +52,5 @@
 			]
 		}
 	},
-	"onCreateCommand": "npm install -g cspell && uv python install && uv sync --all-extras"
+	"onCreateCommand": "curl -fsSL https://antigravity.google/cli/install.sh | bash && npm install -g cspell && uv python install && uv sync --all-extras"
 }
