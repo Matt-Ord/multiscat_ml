@@ -1,15 +1,33 @@
 import contextlib
-import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, override
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from slate_core.plot import get_figure
 from torch import nn, optim
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
+
+from multiscat_ml import plot_loss_curves
+from multiscat_ml.utils import (
+    TrainingStats,
+    plot_validation_loss,
+)
+
+
+@dataclass(kw_only=True, frozen=True)
+class ModelZooEntry:
+    """Entry in model_zoo containing training/loading flags, base path, and PyTorch model."""
+
+    train: bool = False
+    load: bool = True
+    base_path: Path
+    model: nn.Module
+
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -498,46 +516,6 @@ class ExplicitAsymptoticGaborNet(nn.Module):
         return gate * c_persistent + y_transient
 
 
-def _plot_training_convergence(history: dict, save_path: Path) -> None:
-
-    _fig, ax = plt.subplots(figsize=(8, 5), dpi=300)
-    epochs_range = range(1, len(history["train_loss"]) + 1)
-
-    ax.plot(
-        epochs_range,
-        history["train_loss"],
-        label="Training Loss",
-        color="#1f77b4",
-        linewidth=2,
-    )
-    ax.plot(
-        epochs_range,
-        history["val_loss"],
-        label="Validation Loss",
-        color="#ff7f0e",
-        linewidth=2,
-        linestyle="--",
-    )
-
-    ax.set_yscale("log")
-    ax.set_xlabel("Epochs", fontsize=12, fontweight="bold", labelpad=10)
-    ax.set_ylabel("Loss (Log Scale)", fontsize=12, fontweight="bold", labelpad=10)
-    ax.set_title(
-        "Model Convergence Profile Across Real Position Space",
-        fontsize=13,
-        fontweight="bold",
-        pad=15,
-    )
-
-    ax.legend(frameon=True, facecolor="white", edgecolor="none", fontsize=11)
-    ax.tick_params(axis="both", labelsize=10)
-
-    plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
-    plt.close()
-    print(f"--> Convergence plot saved to: {save_path}")
-
-
 def train_model(  # ruff: ignore[too-many-locals, too-many-statements]
     model: nn.Module,
     epochs: tuple[int, int, int] = (200, 100, 100),
@@ -554,7 +532,7 @@ def train_model(  # ruff: ignore[too-many-locals, too-many-statements]
         forward_optimizer, mode="min", factor=0.5, patience=5
     )
 
-    loss_history = {"train_loss": [], "val_loss": []}
+    stats = TrainingStats()
     best_val_loss = float("inf")
     epochs_without_improvement = 0
 
@@ -598,7 +576,6 @@ def train_model(  # ruff: ignore[too-many-locals, too-many-statements]
             )
 
         train_loss /= n_batch
-        loss_history["train_loss"].append(train_loss)
 
         # Validation step
         model.eval()
@@ -608,8 +585,17 @@ def train_model(  # ruff: ignore[too-many-locals, too-many-statements]
                 prediction = model(val_params).squeeze(-1)
                 validation_loss += forward_criterion(prediction, val_targets).item()
 
-        loss_history["val_loss"].append(validation_loss)
         scheduler.step(validation_loss)
+
+        current_weight_decay = float(
+            forward_optimizer.param_groups[0].get("weight_decay", 0.0)
+        )
+        stats.append(
+            train_loss=train_loss,
+            val_loss=validation_loss,
+            weight_decay=current_weight_decay,
+        )
+        stats.save(output_dir / "training_stats.pkl")
 
         epoch_time = time.perf_counter() - epoch_start
         print(
@@ -638,11 +624,7 @@ def train_model(  # ruff: ignore[too-many-locals, too-many-statements]
             break
 
     # Save artifacts
-    loss_history_path = output_dir / "loss_history.json"
-    with loss_history_path.open("w", encoding="utf-8") as f:
-        json.dump(loss_history, f, indent=4)
-
-    _plot_training_convergence(loss_history, output_dir / "convergence_curve.png")
+    stats.save(output_dir / "training_stats.pkl")
     torch.save(model.state_dict(), output_dir / "final_model.pth")
 
 
@@ -697,11 +679,15 @@ def get_prediction_against_z(
 
 
 def compare_models_against_z(
-    model_zoo: dict[str, nn.Module],
-    coordinates: tuple[float, float] = (1.0, 1.0),
-    parameters: tuple[float, float, float] = (2.0, 2.0, 2.0),
+    model_zoo: dict[str, ModelZooEntry],
+    coordinates: tuple[float, float] | None = None,
+    parameters: tuple[float, float, float] | None = None,
 ) -> None:
     """Plot and compares ground truth target vs predictions from multiple models along the z-axis."""
+    sample = _generate_parameters(n_samples=1).squeeze(1).cpu()
+    coordinates = coordinates or (sample[0].item(), sample[1].item())
+    parameters = parameters or (sample[3].item(), sample[4].item(), sample[5].item())
+
     delta_z = _BOUNDS["z"][1] - _BOUNDS["z"][0]
     z_points = torch.linspace(
         _BOUNDS["z"][0] - 0.5 * delta_z,
@@ -732,20 +718,14 @@ def compare_models_against_z(
     )
 
     # 2. Compute predictions for each model in model_zoo
-    for name, model in model_zoo.items():
+    for name, entry in model_zoo.items():
         _, predictions = get_prediction_against_z(
-            model=model,
+            model=entry.model,
             coordinates=coordinates,
             parameters=parameters,
             z_points=z_points,
         )
-        ax.plot(
-            z_np,
-            predictions.cpu().numpy(),
-            label=f"Pred: {name}",
-            linestyle="--",
-            linewidth=1.5,
-        )
+        ax.plot(z_np, predictions.cpu().numpy(), label=f"Pred: {name}", linestyle="--")
 
     ax.set_xlabel("z", fontsize=12, fontweight="bold")
     ax.set_ylabel("f(x, y, z, kx, ky, kz)", fontsize=12, fontweight="bold")
@@ -759,66 +739,110 @@ def compare_models_against_z(
 
     ax.axvline(x=_BOUNDS["z"][0], color="gray", linewidth=2.0)  # cspell: disable-line
     ax.axvline(x=_BOUNDS["z"][1], color="gray", linewidth=2.0)  # cspell: disable-line
-    fig.savefig(
-        "data/15/model_comparison_vs_z.png",
-        bbox_inches="tight",
-        dpi=300,
+    fig.savefig("data/15/model_comparison_vs_z.pdf")
+
+
+def compare_model_validation_loss(
+    model_zoo: dict[str, ModelZooEntry],
+) -> None:
+    """Plot validation loss for each model in the model zoo.
+
+    Parameters
+    ----------
+    model_zoo : dict[str, ModelZooEntry]
+        Dictionary mapping model names to ModelZooEntry instances.
+
+    """
+    fig, ax = get_figure()
+    for name, entry in model_zoo.items():
+        stats_path = entry.base_path / "training_stats.pkl"
+        if stats_path.exists():
+            stats = TrainingStats.load(stats_path)
+            fig, ax, line = plot_validation_loss(stats, ax=ax)
+            line.set_label(name)
+
+    ax.set_yscale("log")
+    ax.set_xlabel("Epochs", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Validation Loss (Log Scale)", fontsize=12, fontweight="bold")
+    ax.set_title(
+        "Model Validation Loss Comparison",
+        fontsize=13,
+        fontweight="bold",
     )
+    ax.legend(frameon=True, facecolor="white", edgecolor="none")
+
+    fig.savefig("data/15/model_validation_loss_comparison.pdf")
 
 
 def _load_best_models(
-    model_zoo: dict[str, nn.Module], base_path: Path = Path("data/15")
+    model_zoo: dict[str, ModelZooEntry],
 ) -> None:
-    """Load the best model checkpoints from disk into the provided model zoo."""
-    for name, model in model_zoo.items():
-        ckpt_path = base_path / name / "best_model.pth"
-        if ckpt_path.exists():
-            checkpoint = torch.load(ckpt_path, map_location=DEVICE)
-            model.load_state_dict(checkpoint["model_state_dict"])
-            print(f"✓ Loaded trained weights for {name} from {ckpt_path}")
+    """Load the best model checkpoints from disk into the provided model zoo based on per-model load flag."""
+    for name, entry in model_zoo.items():
+        if entry.load:
+            ckpt_path = entry.base_path / "best_model.pth"
+            if ckpt_path.exists():
+                checkpoint = torch.load(ckpt_path, map_location=DEVICE)
+                entry.model.load_state_dict(checkpoint["model_state_dict"])
+                print(f"✓ Loaded trained weights for {name} from {ckpt_path}")
 
 
 if __name__ == "__main__":
-    RUN_TRAIN = True
-    RUN_TEST = True
-    LOAD_CHECKPOINTS = True
-
-    model_zoo: dict[str, nn.Module] = {
-        "PureSIREN": PureSIREN(
-            param_dim=6, output_dim=1, first_omega_0=1.0, hidden_omega_0=1.0
+    model_zoo: dict[str, ModelZooEntry] = {
+        "PureSIREN": ModelZooEntry(
+            train=False,
+            load=True,
+            base_path=Path("data/15/PureSIREN"),
+            model=PureSIREN(
+                param_dim=6, output_dim=1, first_omega_0=1.0, hidden_omega_0=1.0
+            ),
         ),
-        "CondSIREN": ForwardCondSIRENStateModel(
-            param_dim=6, output_dim=1, first_omega_0=1.0, hidden_omega_0=1.0
+        "CondSIREN": ModelZooEntry(
+            train=False,
+            load=True,
+            base_path=Path("data/15/CondSIREN"),
+            model=ForwardCondSIRENStateModel(
+                param_dim=6, output_dim=1, first_omega_0=1.0, hidden_omega_0=1.0
+            ),
         ),
-        "PlainMLP": PureMLP(param_dim=6, output_dim=1),
-        "ExplicitAsymptoticGaborNet": ExplicitAsymptoticGaborNet(
-            in_dim=6,
-            hidden_dim=128,
-            omega_0=3.0,
-            sigma_0=1.5,
-            output_dim=1,
+        "PlainMLP": ModelZooEntry(
+            train=False,
+            load=True,
+            base_path=Path("data/15/PlainMLP"),
+            model=PureMLP(param_dim=6, output_dim=1),
+        ),
+        "ExplicitAsymptoticGaborNet": ModelZooEntry(
+            train=False,
+            load=True,
+            base_path=Path("data/15/ExplicitAsymptoticGaborNet"),
+            model=ExplicitAsymptoticGaborNet(
+                in_dim=6,
+                hidden_dim=128,
+                omega_0=3.0,
+                sigma_0=1.5,
+                output_dim=1,
+            ),
         ),
     }
-    if LOAD_CHECKPOINTS:
-        _load_best_models(model_zoo=model_zoo, base_path=Path("data/15"))
 
-    # 1. Train Models Generic Loop
-    if RUN_TRAIN:
-        for name, model in model_zoo.items():
+    _load_best_models(model_zoo=model_zoo)
+
+    for name, entry in model_zoo.items():
+        if entry.train:
             print(f"\n[{name}] Training started on device: {DEVICE}")
             train_model(
-                model=model,
+                model=entry.model,
                 epochs=(200, 100, 100),
-                output_dir=Path(f"data/15/{name}"),
+                output_dir=entry.base_path,
             )
-    if RUN_TEST:
-        sample = _generate_parameters(n_samples=1).squeeze(1).cpu()
 
-        # Extract (x, y) coordinates and (kx, ky, kz) parameters
-        rand_coords = (sample[0].item(), sample[1].item())
-        rand_params = (sample[3].item(), sample[4].item(), sample[5].item())
-        compare_models_against_z(
-            model_zoo=model_zoo,
-            coordinates=rand_coords,
-            parameters=rand_params,
-        )
+    for entry in model_zoo.values():
+        if (entry.base_path / "training_stats.pkl").exists():
+            stats = TrainingStats.load(entry.base_path / "training_stats.pkl")
+            fig, ax = plot_loss_curves(stats)
+            fig.savefig(
+                entry.base_path / "loss_curves.png", bbox_inches="tight", dpi=300
+            )
+
+    compare_model_validation_loss(model_zoo=model_zoo)
+    compare_models_against_z(model_zoo=model_zoo)
