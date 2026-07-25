@@ -1,8 +1,7 @@
-import contextlib
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, override
+from typing import override
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -98,24 +97,6 @@ def _generate_dataset(n_samples: int) -> tuple[torch.Tensor, torch.Tensor]:
     params = _generate_parameters(n_samples)
     targets = _test_function(params)
     return params.T, targets  # Returns (n_samples, 6) and (n_samples,)
-
-
-@contextlib.contextmanager
-def freeze_parameters(model: nn.Module) -> Any:  # ruff: ignore[any-type]
-    """Temporarily disables gradient computation for a model's parameters."""
-    # Save the original requires_grad state for each parameter
-    original_states = {param: param.requires_grad for param in model.parameters()}
-
-    # Freeze all parameters
-    for param in model.parameters():
-        param.requires_grad = False
-
-    try:
-        yield  # This is where the code inside your `with` block runs
-    finally:
-        # Restore the original states afterward, even if an error occurs
-        for param, original_state in original_states.items():
-            param.requires_grad = original_state
 
 
 class SirenLayer(nn.Module):

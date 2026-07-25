@@ -1,4 +1,3 @@
-import contextlib
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, override
@@ -330,24 +329,6 @@ class HDF5ScatteringDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
     def __del__(self) -> None:
         if self.file is not None:
             self.file.close()
-
-
-@contextlib.contextmanager
-def freeze_parameters(model: nn.Module) -> Any:  # ruff: ignore[any-type]
-    """Temporarily disables gradient computation for a model's parameters."""
-    # Save the original requires_grad state for each parameter
-    original_states = {param: param.requires_grad for param in model.parameters()}
-
-    # Freeze all parameters
-    for param in model.parameters():
-        param.requires_grad = False
-
-    try:
-        yield  # This is where the code inside your `with` block runs
-    finally:
-        # Restore the original states afterward, even if an error occurs
-        for param, original_state in original_states.items():
-            param.requires_grad = original_state
 
 
 def generate() -> None:
