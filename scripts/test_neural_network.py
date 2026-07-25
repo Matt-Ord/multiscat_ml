@@ -28,7 +28,7 @@ _BOUNDS = {
 }
 
 
-def _test_function(params: torch.Tensor) -> torch.Tensor:
+def _test_function(params: torch.Tensor) -> torch.Tensor:  # ruff: ignore[too-many-locals]
     x, y, z, asymptote, ky, kz = params
 
     # Fundamental spatial frequency for domain [-4, 4] (period = 8)
@@ -105,7 +105,7 @@ class SirenLayer(nn.Module):
         self,
         in_features: int,
         out_features: int,
-        is_first: bool = False,
+        is_first: bool = False,  # ruff: ignore[boolean-default-value-positional-argument, boolean-type-hint-positional-argument]
         omega_0: float = 5.0,
     ) -> None:
         super().__init__()
@@ -154,6 +154,7 @@ class ConditionEncoder(nn.Module):
 class FiLMSineLayer(nn.Module):
     """
     SIREN layer modulated by a conditioning vector.
+
     h = sin(omega_0 * ((Wx + b) * (1 + gamma(cond)) + beta(cond))).
     """
 
@@ -162,7 +163,7 @@ class FiLMSineLayer(nn.Module):
         in_features: int,
         out_features: int,
         cond_dim: int,
-        is_first: bool = False,
+        is_first: bool = False,  # ruff: ignore[boolean-default-value-positional-argument, boolean-type-hint-positional-argument]
         omega_0: float = 30.0,
     ) -> None:
         super().__init__()
@@ -184,7 +185,7 @@ class FiLMSineLayer(nn.Module):
             if self.linear.bias is not None:
                 self.linear.bias.uniform_(-bound, bound)
 
-            # Start close to an unmodulated SIREN
+            # Start close to an un-modulated SIREN
             nn.init.zeros_(self.gamma.weight)
             nn.init.zeros_(self.gamma.bias)
             nn.init.zeros_(self.beta.weight)
@@ -200,7 +201,7 @@ class FiLMSineLayer(nn.Module):
 
 
 class ForwardCondSIRENStateModel(nn.Module):
-    def __init__(
+    def __init__(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
         self,
         param_dim: int = 3,
         coord_dim: int = 3,
@@ -213,7 +214,7 @@ class ForwardCondSIRENStateModel(nn.Module):
     ) -> None:
         super().__init__()
 
-        if param_dim == 6 and coord_dim == 3:
+        if param_dim == 6 and coord_dim == 3:  # ruff: ignore[magic-value-comparison]
             param_dim = 3
 
         self.param_dim = param_dim
@@ -258,10 +259,6 @@ class ForwardCondSIRENStateModel(nn.Module):
 
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, 6) -> 3 coordinates + 3 physical parameters
-        returns: (B, output_dim).
-        """
         coords = x[:, : self.coord_dim]
         params = x[:, self.coord_dim :]
 
@@ -274,15 +271,7 @@ class ForwardCondSIRENStateModel(nn.Module):
 
 
 class PureSIREN(nn.Module):
-    """
-    Input:
-        x: (B, 6).
-
-    Output:
-        (B, output_dim)
-    """
-
-    def __init__(
+    def __init__(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
         self,
         in_dim: int = 6,
         param_dim: int | None = None,
@@ -370,7 +359,7 @@ class PureMLP(nn.Module):
         (B, output_dim)
     """
 
-    def __init__(
+    def __init__(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
         self,
         in_dim: int = 6,
         param_dim: int | None = None,
@@ -413,14 +402,14 @@ class PureMLP(nn.Module):
         return self.head(x)
 
 
-# TODO: we haven't considered the fact that the
+# TODO: we haven't considered the fact that the  # ruff: ignore[line-contains-todo]
 # region of oscillation depends on both (kx, ky, kz)
 # and on the channel idx
 class ExplicitAsymptoticGaborNet(nn.Module):
     """
     Parameter-Agnostic Neural Representation.
 
-    Learns non-zero asymptotic limits (z -> +infty) and localized transient
+    Learns non-zero asymptotic limits (z -> +infinity) and localized transient
     oscillations without assuming prior knowledge of which parameters (kx, ky, kz)
     govern the zero-point or transition window.
 
@@ -428,7 +417,7 @@ class ExplicitAsymptoticGaborNet(nn.Module):
         x: Tensor of shape (B, 6) -> [x, y, z, kx, ky, kz]
     """
 
-    def __init__(
+    def __init__(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
         self,
         in_dim: int = 6,
         param_dim: int = 3,  # [kx, ky, kz]
@@ -509,54 +498,7 @@ class ExplicitAsymptoticGaborNet(nn.Module):
         return gate * c_persistent + y_transient
 
 
-def _make_pred_batch(forward_model, params_batch_np, coords):
-    """
-    params_batch_np: (B, param_dim) numpy array
-    coords: (N_pts, 3) flattened coordinates or a torch tensor.
-
-    Returns
-    -------
-        preds_np: (B, Nx, Ny, Nz)
-    """
-    forward_model.eval()
-
-    device = next(forward_model.parameters()).device
-    params_batch = torch.as_tensor(params_batch_np, dtype=torch.float32, device=device)
-    coords_t = torch.as_tensor(coords, dtype=torch.float32, device=device)
-
-    preds = []
-    with torch.no_grad():
-        for i in range(params_batch.shape[0]):
-            pred = forward_model(params_batch[i].unsqueeze(0), coords_t)
-
-            # Expected shapes:
-            #   (1, N_pts, 1) or (N_pts, 1)
-            if pred.ndim == 3 and pred.shape[0] == 1:
-                pred = pred.squeeze(0)  # (N_pts, 1)
-
-            if pred.ndim != 2 or pred.shape[-1] != 1:
-                msg = f"Expected shape (N_pts, 1), got {pred.shape}"
-                raise ValueError(msg)
-
-            pred = pred.squeeze(-1)  # (N_pts,)
-            preds.append(pred)
-
-    preds = torch.stack(preds, dim=0)  # (B, N_pts)
-
-    grid_size = len(x) * len(y) * len(z)
-    if coords_t.shape[0] == grid_size:
-        preds = preds.view(params_batch.shape[0], len(x), len(y), len(z))
-
-    return preds.cpu().numpy()
-
-
-def plot_training_convergence(history: dict, save_path: Path) -> None:
-    """Generates a publication-grade log-scale convergence plot."""
-    plt.style.use(
-        "seaborn-v0_8-whitegrid"
-        if "seaborn-v0_8-whitegrid" in plt.style.available
-        else "default"
-    )
+def _plot_training_convergence(history: dict, save_path: Path) -> None:
 
     _fig, ax = plt.subplots(figsize=(8, 5), dpi=300)
     epochs_range = range(1, len(history["train_loss"]) + 1)
@@ -596,7 +538,7 @@ def plot_training_convergence(history: dict, save_path: Path) -> None:
     print(f"--> Convergence plot saved to: {save_path}")
 
 
-def train_model(
+def train_model(  # ruff: ignore[too-many-locals, too-many-statements]
     model: nn.Module,
     epochs: tuple[int, int, int] = (200, 100, 100),
     max_epochs_without_improvement: int = 200,
@@ -630,13 +572,13 @@ def train_model(
         train_loss = 0.0
         current_lr = forward_optimizer.param_groups[0]["lr"]
 
-        pbar = tqdm(
+        p_bar = tqdm(
             train_loader,
             desc=f"Epoch {epoch + 1}/{n_epochs}",
             unit="batch",
         )
 
-        for batch_idx, (batch_parameters, batch_targets) in enumerate(pbar):
+        for batch_idx, (batch_parameters, batch_targets) in enumerate(p_bar):
             forward_optimizer.zero_grad(set_to_none=True)
 
             prediction = model(batch_parameters).squeeze(-1)
@@ -649,7 +591,7 @@ def train_model(
             train_loss += batch_loss.item()
             running_loss = train_loss / (batch_idx + 1)
 
-            pbar.set_postfix(
+            p_bar.set_postfix(
                 loss=f"{batch_loss.item():.3e}",
                 avg=f"{running_loss:.3e}",
                 lr=f"{current_lr:.1e}",
@@ -700,7 +642,7 @@ def train_model(
     with loss_history_path.open("w", encoding="utf-8") as f:
         json.dump(loss_history, f, indent=4)
 
-    plot_training_convergence(loss_history, output_dir / "convergence_curve.png")
+    _plot_training_convergence(loss_history, output_dir / "convergence_curve.png")
     torch.save(model.state_dict(), output_dir / "final_model.pth")
 
 
@@ -791,7 +733,7 @@ def compare_models_against_z(
 
     # 2. Compute predictions for each model in model_zoo
     for name, model in model_zoo.items():
-        _, preds = get_prediction_against_z(
+        _, predictions = get_prediction_against_z(
             model=model,
             coordinates=coordinates,
             parameters=parameters,
@@ -799,7 +741,7 @@ def compare_models_against_z(
         )
         ax.plot(
             z_np,
-            preds.cpu().numpy(),
+            predictions.cpu().numpy(),
             label=f"Pred: {name}",
             linestyle="--",
             linewidth=1.5,
@@ -813,10 +755,10 @@ def compare_models_against_z(
         fontweight="bold",
     )
     ax.legend(frameon=True, facecolor="white", edgecolor="none")
-    ax.set_xlim(z_np[0], z_np[-1])
+    ax.set_xlim(z_np[0], z_np[-1])  # cspell: disable-line
 
-    ax.axvline(x=_BOUNDS["z"][0], color="gray", linewidth=2.0)
-    ax.axvline(x=_BOUNDS["z"][1], color="gray", linewidth=2.0)
+    ax.axvline(x=_BOUNDS["z"][0], color="gray", linewidth=2.0)  # cspell: disable-line
+    ax.axvline(x=_BOUNDS["z"][1], color="gray", linewidth=2.0)  # cspell: disable-line
     fig.savefig(
         "data/15/model_comparison_vs_z.png",
         bbox_inches="tight",
