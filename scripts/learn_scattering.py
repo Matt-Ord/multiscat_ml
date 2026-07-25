@@ -333,7 +333,7 @@ class HDF5ScatteringDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
 
 @contextlib.contextmanager
-def freeze_parameters(model: nn.Module) -> Any:  # noqa: ANN401
+def freeze_parameters(model: nn.Module) -> Any:  # ruff: ignore[any-type]
     """Temporarily disables gradient computation for a model's parameters."""
     # Save the original requires_grad state for each parameter
     original_states = {param: param.requires_grad for param in model.parameters()}
@@ -364,7 +364,7 @@ def load_datasets() -> ConcatDataset[tuple[torch.Tensor, torch.Tensor]]:
     return ConcatDataset[tuple[torch.Tensor, torch.Tensor]](datasets)
 
 
-def train() -> None:  # noqa: PLR0914
+def train() -> None:  # ruff: ignore[too-many-locals]
     dataset = load_datasets()
     train_dataset, val_dataset = random_split(dataset, [0.8, 0.2])
 
@@ -403,8 +403,8 @@ def train() -> None:  # noqa: PLR0914
         train_loss_f = 0.0
 
         for params_batch, s_mat_batch in train_loader:
-            params_batch = params_batch.to(DEVICE)  # noqa: PLW2901
-            s_mat_batch = s_mat_batch.to(DEVICE)  # noqa: PLW2901
+            params_batch = params_batch.to(DEVICE)  # ruff: ignore[redefined-loop-name]
+            s_mat_batch = s_mat_batch.to(DEVICE)  # ruff: ignore[redefined-loop-name]
             # --- Forward Model Update ---
             forward_optimizer.zero_grad()
             s_mat_pred = forward_model(params_batch)
@@ -419,8 +419,8 @@ def train() -> None:  # noqa: PLR0914
 
         with torch.no_grad():
             for params_batch, s_mat_batch in val_loader:
-                params_batch = params_batch.to(DEVICE)  # noqa: PLW2901
-                s_mat_batch = s_mat_batch.to(DEVICE)  # noqa: PLW2901
+                params_batch = params_batch.to(DEVICE)  # ruff: ignore[redefined-loop-name]
+                s_mat_batch = s_mat_batch.to(DEVICE)  # ruff: ignore[redefined-loop-name]
 
                 # Forward Model Validation
                 s_mat_pred = forward_model(params_batch)

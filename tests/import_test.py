@@ -1,6 +1,6 @@
 def test_import() -> None:
     try:
-        import multiscat_ml  # noqa: PLC0415
+        import multiscat_ml  # ruff: ignore[import-outside-top-level]
     except ImportError:
         multiscat_ml = None  # ty:ignore[invalid-assignment]
 
