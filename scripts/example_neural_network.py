@@ -1,7 +1,7 @@
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import override
+from typing import TYPE_CHECKING, Self, override
 
 import numpy as np
 import torch
@@ -16,16 +16,9 @@ from multiscat_ml.utils import (
     plot_validation_loss,
 )
 
-
-@dataclass(kw_only=True, frozen=True)
-class ModelZooEntry:
-    """Entry in model_zoo containing training/loading flags, base path, and PyTorch model."""
-
-    train: bool = False
-    load: bool = True
-    base_path: Path
-    model: nn.Module
-
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -497,15 +490,14 @@ class ExplicitAsymptoticGaborNet(nn.Module):
 
 
 def train_model(  # ruff: ignore[too-many-locals, too-many-statements]
-    model: nn.Module,
+    model_entry: ModelZooEntry,
     epochs: tuple[int, int, int] = (200, 100, 100),
     max_epochs_without_improvement: int = 200,
-    output_dir: Path = Path("data/15"),
 ) -> None:
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    model_entry.base_path.mkdir(parents=True, exist_ok=True)
 
-    model = model.to(DEVICE)
+    model = model_entry.model.to(DEVICE)
     forward_criterion = nn.MSELoss()
     forward_optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -575,7 +567,7 @@ def train_model(  # ruff: ignore[too-many-locals, too-many-statements]
             val_loss=validation_loss,
             weight_decay=current_weight_decay,
         )
-        stats.save(output_dir / "training_stats.pkl")
+        stats.save(model_entry.stats_path)
 
         epoch_time = time.perf_counter() - epoch_start
         print(
@@ -586,15 +578,7 @@ def train_model(  # ruff: ignore[too-many-locals, too-many-statements]
         if validation_loss < best_val_loss:
             best_val_loss = validation_loss
             epochs_without_improvement = 0
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": forward_optimizer.state_dict(),
-                    "epoch": epoch,
-                    "val_loss": validation_loss,
-                },
-                output_dir / "best_model.pth",
-            )
+            torch.save(model.state_dict(), model_entry.best_model_path)
             print("✓ Saved new best model checkpoint.")
         else:
             epochs_without_improvement += 1
@@ -604,19 +588,16 @@ def train_model(  # ruff: ignore[too-many-locals, too-many-statements]
             break
 
     # Save artifacts
-    stats.save(output_dir / "training_stats.pkl")
-    torch.save(model.state_dict(), output_dir / "final_model.pth")
+    stats.save(model_entry.stats_path)
+    torch.save(model.state_dict(), model_entry.final_model_path)
 
 
 def get_target_against_z(
-    coordinates: tuple[float, float] = (1.0, 1.0),
-    parameters: tuple[float, float, float] = (2.0, 2.0, 2.0),
-    z_points: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    coordinates: tuple[float, float],
+    parameters: tuple[float, float, float],
+    z_points: torch.Tensor,
+) -> torch.Tensor:
     """Evaluate the ground truth target function f(z) over a z-range for fixed (x, y) and wavevectors."""
-    if z_points is None:
-        z_points = torch.linspace(_BOUNDS["z"][0], _BOUNDS["z"][1], 100, device=DEVICE)
-
     n_pts = len(z_points)
     x_t = torch.full((n_pts,), coordinates[0], device=DEVICE)
     y_t = torch.full((n_pts,), coordinates[1], device=DEVICE)
@@ -626,21 +607,16 @@ def get_target_against_z(
 
     # Shape expected by _test_function: (6, N)
     params = torch.stack([x_t, y_t, z_points, kx_t, ky_t, kz_t], dim=0)
-    targets = _test_function(params)
-
-    return z_points, targets
+    return _test_function(params)
 
 
 def get_prediction_against_z(
     model: nn.Module,
-    coordinates: tuple[float, float] = (1.0, 1.0),
-    parameters: tuple[float, float, float] = (2.0, 2.0, 2.0),
-    z_points: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    coordinates: tuple[float, float],
+    parameters: tuple[float, float, float],
+    z_points: torch.Tensor,
+) -> torch.Tensor:
     """Generate predictions f(z) from a model over a z-range for fixed (x, y) and wavevectors."""
-    if z_points is None:
-        z_points = torch.linspace(_BOUNDS["z"][0], _BOUNDS["z"][1], 100, device=DEVICE)
-
     n_pts = len(z_points)
     x_t = torch.full((n_pts,), coordinates[0], device=DEVICE)
     y_t = torch.full((n_pts,), coordinates[1], device=DEVICE)
@@ -653,16 +629,47 @@ def get_prediction_against_z(
 
     model.eval()
     with torch.no_grad():
-        predictions = model(inputs).squeeze(-1)
+        return model(inputs).squeeze(-1)
 
-    return z_points, predictions
+
+@dataclass(kw_only=True, frozen=True)
+class ModelZooEntry:
+    """Entry in model_zoo containing training/loading flags, base path, and PyTorch model."""
+
+    train: bool = False
+    base_path: Path
+    model: nn.Module
+    name: str
+
+    @property
+    def stats_path(self) -> Path:
+        return self.base_path / self.name / "training_stats.pkl"
+
+    @property
+    def best_model_path(self) -> Path:
+        return self.base_path / self.name / "best_model.pth"
+
+    @property
+    def final_model_path(self) -> Path:
+        return self.base_path / self.name / "final_model.pth"
+
+    def load_best(self) -> Self:
+        """Load the model weights from the best checkpoint if it exists."""
+        if self.best_model_path.exists():
+            self.model.load_state_dict(
+                torch.load(self.best_model_path, map_location=DEVICE)
+            )
+            print(f"Loaded model weights for {self.name}.")
+        else:
+            print(f"No best model checkpoint found for {self.name}.")
+        return self
 
 
 def compare_models_against_z(
-    model_zoo: dict[str, ModelZooEntry],
+    model_zoo: list[ModelZooEntry],
     coordinates: tuple[float, float] | None = None,
     parameters: tuple[float, float, float] | None = None,
-) -> None:
+) -> tuple[Figure, Axes]:
     """Plot and compares ground truth target vs predictions from multiple models along the z-axis."""
     sample = _generate_parameters(n_samples=1).squeeze(1).cpu()
     coordinates = coordinates or (sample[0].item(), sample[1].item())
@@ -676,8 +683,7 @@ def compare_models_against_z(
         device=DEVICE,
     )
 
-    # 1. Compute ground truth
-    _, targets = get_target_against_z(
+    targets_values = get_target_against_z(
         coordinates=coordinates, parameters=parameters, z_points=z_points
     )
 
@@ -686,51 +692,44 @@ def compare_models_against_z(
     z_np = z_points.cpu().numpy()
     ax.plot(
         z_np,
-        targets.cpu().numpy(),
+        targets_values.cpu().numpy(),
         label="Target (Ground Truth)",
         color="black",
         linewidth=2.0,
     )
 
-    # 2. Compute predictions for each model in model_zoo
-    for name, entry in model_zoo.items():
-        _, predictions = get_prediction_against_z(
-            model=entry.model,
+    for model in model_zoo:
+        predictions = get_prediction_against_z(
+            model=model.model,
             coordinates=coordinates,
             parameters=parameters,
             z_points=z_points,
         )
-        ax.plot(z_np, predictions.cpu().numpy(), label=f"Pred: {name}", linestyle="--")
+        (line,) = ax.plot(z_np, predictions.cpu().numpy())
+        line.set_label(model.name)
+        line.set_linestyle("--")
 
     ax.set_xlabel("z")
-    ax.set_ylabel("f(x, y, z, kx, ky, kz)")
+    ax.set_ylabel("f(z)")
     ax.set_title("Model Comparison vs z-axis")
     ax.legend()
     ax.set_xlim(z_np[0], z_np[-1])  # cspell: disable-line
 
     ax.axvline(x=_BOUNDS["z"][0], color="gray", linewidth=2.0)  # cspell: disable-line
     ax.axvline(x=_BOUNDS["z"][1], color="gray", linewidth=2.0)  # cspell: disable-line
-    fig.savefig("data/15/model_comparison_vs_z.pdf")
+    return fig, ax
 
 
 def compare_model_validation_loss(
-    model_zoo: dict[str, ModelZooEntry],
-) -> None:
-    """Plot validation loss for each model in the model zoo.
+    model_zoo: list[ModelZooEntry],
+) -> tuple[Figure, Axes]:
 
-    Parameters
-    ----------
-    model_zoo : dict[str, ModelZooEntry]
-        Dictionary mapping model names to ModelZooEntry instances.
-
-    """
     fig, ax = get_figure()
-    for name, entry in model_zoo.items():
-        stats_path = entry.base_path / "training_stats.pkl"
-        if stats_path.exists():
-            stats = TrainingStats.load(stats_path)
+    for model in model_zoo:
+        if model.stats_path.exists():
+            stats = TrainingStats.load(model.stats_path)
             fig, ax, line = plot_validation_loss(stats, ax=ax)
-            line.set_label(name)
+            line.set_label(model.name)
 
     ax.set_yscale("log")
     ax.set_xlabel("Epochs", fontsize=12, fontweight="bold")
@@ -742,50 +741,37 @@ def compare_model_validation_loss(
     )
     ax.legend(frameon=True, facecolor="white", edgecolor="none")
 
-    fig.savefig("data/15/model_validation_loss_comparison.pdf")
-
-
-def _load_best_models(
-    model_zoo: dict[str, ModelZooEntry],
-) -> None:
-    """Load the best model checkpoints from disk into the provided model zoo based on per-model load flag."""
-    for name, entry in model_zoo.items():
-        if entry.load:
-            ckpt_path = entry.base_path / "best_model.pth"
-            if ckpt_path.exists():
-                checkpoint = torch.load(ckpt_path, map_location=DEVICE)
-                entry.model.load_state_dict(checkpoint["model_state_dict"])
-                print(f"✓ Loaded trained weights for {name} from {ckpt_path}")
+    return fig, ax
 
 
 if __name__ == "__main__":
-    model_zoo: dict[str, ModelZooEntry] = {
-        "PureSIREN": ModelZooEntry(
+    model_zoo: list[ModelZooEntry] = [
+        ModelZooEntry(
+            name="PureSIREN",
             train=False,
-            load=True,
-            base_path=Path("data/15/PureSIREN"),
+            base_path=Path("data/example_network"),
             model=PureSIREN(
                 param_dim=6, output_dim=1, first_omega_0=1.0, hidden_omega_0=1.0
             ),
-        ),
-        "CondSIREN": ModelZooEntry(
+        ).load_best(),
+        ModelZooEntry(
+            name="CondSIREN",
             train=False,
-            load=True,
-            base_path=Path("data/15/CondSIREN"),
+            base_path=Path("data/example_network"),
             model=ForwardCondSIRENStateModel(
                 param_dim=6, output_dim=1, first_omega_0=1.0, hidden_omega_0=1.0
             ),
-        ),
-        "PlainMLP": ModelZooEntry(
+        ).load_best(),
+        ModelZooEntry(
+            name="PlainMLP",
             train=False,
-            load=True,
-            base_path=Path("data/15/PlainMLP"),
+            base_path=Path("data/example_network"),
             model=PureMLP(param_dim=6, output_dim=1),
-        ),
-        "ExplicitAsymptoticGaborNet": ModelZooEntry(
+        ).load_best(),
+        ModelZooEntry(
+            name="ExplicitAsymptoticGaborNet",
             train=False,
-            load=True,
-            base_path=Path("data/15/ExplicitAsymptoticGaborNet"),
+            base_path=Path("data/example_network"),
             model=ExplicitAsymptoticGaborNet(
                 in_dim=6,
                 hidden_dim=128,
@@ -793,25 +779,21 @@ if __name__ == "__main__":
                 sigma_0=1.5,
                 output_dim=1,
             ),
-        ),
-    }
+        ).load_best(),
+    ]
 
-    _load_best_models(model_zoo=model_zoo)
+    for m in model_zoo:
+        if m.train:
+            print(f"\n[{m.name}] Training started on device: {DEVICE}")
+            train_model(model_entry=m, epochs=(200, 100, 100))
 
-    for name, entry in model_zoo.items():
-        if entry.train:
-            print(f"\n[{name}] Training started on device: {DEVICE}")
-            train_model(
-                model=entry.model,
-                epochs=(200, 100, 100),
-                output_dir=entry.base_path,
-            )
-
-    for entry in model_zoo.values():
-        if (entry.base_path / "training_stats.pkl").exists():
-            stats = TrainingStats.load(entry.base_path / "training_stats.pkl")
+    for model in model_zoo:
+        if model.stats_path.exists():
+            stats = TrainingStats.load(model.stats_path)
             fig, ax = plot_loss_curves(stats)
-            fig.savefig(entry.base_path / "loss_curves.pdf")
+            fig.savefig(model.base_path / "loss_curves.pdf")
 
-    compare_model_validation_loss(model_zoo=model_zoo)
-    compare_models_against_z(model_zoo=model_zoo)
+    fig, _ = compare_model_validation_loss(model_zoo=model_zoo)
+    fig.savefig("data/15/model_validation_loss_comparison.pdf")
+    fig, _ = compare_models_against_z(model_zoo=model_zoo)
+    fig.savefig("data/15/model_comparison_vs_z.pdf")
