@@ -1,6 +1,6 @@
 """Utility functions and classes for multiscat_ml."""
 
-import pickle
+import pickle  # ruff: ignore[suspicious-pickle-import]
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING

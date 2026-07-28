@@ -30,5 +30,3 @@ def test_training_stats() -> None:
         assert loaded.train_loss == [0.5, 0.3]
         assert loaded.val_loss == [0.6, 0.4]
         assert loaded.weight_decay == [0.01, 0.005]
-
-
