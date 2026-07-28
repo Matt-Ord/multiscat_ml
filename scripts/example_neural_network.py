@@ -40,8 +40,6 @@ _BOUNDS = {
 def _test_function(params: torch.Tensor) -> torch.Tensor:  # ruff: ignore[too-many-locals]
     x, y, z, asymptote, ky, kz = params
 
-    # Fundamental spatial frequency for domain [-4, 4] (period = 8)
-
     z_start = -2.0 + 0.2 * kz  # Region where function departs from 0 (around z = -2)
     z_flat = 3.25 + 0.25 * kz  # Plateau region where it flattens out (z = 3.5 to 5)
     width = z_flat - z_start
@@ -397,21 +395,10 @@ class PureMLP(nn.Module):
 # region of oscillation depends on both (kx, ky, kz)
 # and on the channel idx
 class ExplicitAsymptoticGaborNet(nn.Module):
-    """
-    Parameter-Agnostic Neural Representation.
-
-    Learns non-zero asymptotic limits (z -> +infinity) and localized transient
-    oscillations without assuming prior knowledge of which parameters (kx, ky, kz)
-    govern the zero-point or transition window.
-
-    Inputs:
-        x: Tensor of shape (B, 6) -> [x, y, z, kx, ky, kz]
-    """
-
     def __init__(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
         self,
         in_dim: int = 6,
-        param_dim: int = 3,  # [kx, ky, kz]
+        param_dim: int = 3,
         hidden_dim: int = 128,
         omega_0: float = 3.0,
         sigma_0: float = 1.5,
@@ -419,7 +406,7 @@ class ExplicitAsymptoticGaborNet(nn.Module):
     ) -> None:
         super().__init__()
 
-        # 1. Persistent 2D Stream: Inputs are [x, y, kx, ky, kz] (5 features, NO z)
+        # 1. Persistent 2D Stream
         self.persistent_net = nn.Sequential(
             SirenLayer(
                 in_features=2 + param_dim,
@@ -436,7 +423,7 @@ class ExplicitAsymptoticGaborNet(nn.Module):
             nn.Linear(hidden_dim, output_dim),
         )
 
-        # 2. Fully Parameter-Agnostic z-Gate: Inputs are [z, kx, ky, kz] (1 + param_dim features)
+        # 2. Parameter-Agnostic z-Gate
         self.z_gate = nn.Sequential(
             nn.Linear(1 + param_dim, 32),
             nn.GELU(),
@@ -445,7 +432,6 @@ class ExplicitAsymptoticGaborNet(nn.Module):
 
         # 3. Localized Transient Gabor Stream
         self.freq_linear = nn.Linear(in_dim, hidden_dim)
-        # Envelope takes [z, kx, ky, kz] to allow any parameter to scale/shift the Gabor window
         self.envelope_linear = nn.Linear(1 + param_dim, hidden_dim)
         self.transient_head = nn.Linear(hidden_dim, output_dim)
 
@@ -464,28 +450,116 @@ class ExplicitAsymptoticGaborNet(nn.Module):
 
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Deconstruct inputs: x[:, :2] -> [x, y], x[:, 2:3] -> [z], x[:, 3:] -> [kx, ky, kz]
+
+        # Deconstruct inputs
         z = x[:, 2:3]
         params = x[:, 3:]  # [kx, ky, kz]
 
-        # A. Spatial 2D inputs for persistent waves: [x, y, kx, ky, kz]
         spatial_inputs = torch.cat([x[:, :2], params], dim=-1)
         c_persistent = self.persistent_net(spatial_inputs)
 
-        # B. Combined z-parameter vector: [z, kx, ky, kz]
         z_and_params = torch.cat([z, params], dim=-1)
-
-        # C. Parameter-Agnostic Gate: Learns switch behavior for any mode combination
         gate = torch.sigmoid(self.z_gate(z_and_params))
 
-        # D. Localized Transient Gabor Stream
         freq = self.omega_0 * self.freq_linear(x)
         envelope = self.sigma_0 * self.envelope_linear(z_and_params)
 
         gabor_feats = torch.sin(freq) * torch.exp(-0.5 * (envelope**2))
         y_transient = self.transient_head(gabor_feats)
 
-        # Output = Asymptotic Plateau + Localized Oscillations
+        return gate * c_persistent + y_transient
+
+
+class ExplicitAsymptoticGaborNet1(nn.Module):
+    def __init__(
+        self,
+        in_dim: int = 6,
+        param_dim: int = 3,
+        hidden_dim: int = 128,
+        omega_0: float = 3.0,
+        output_dim: int = 1,
+    ) -> None:
+        super().__init__()
+
+        # 1. Persistent 2D Stream
+        self.persistent_net = nn.Sequential(
+            SirenLayer(
+                in_features=2 + param_dim,
+                out_features=hidden_dim,
+                is_first=True,
+                omega_0=omega_0,
+            ),
+            SirenLayer(
+                in_features=hidden_dim,
+                out_features=hidden_dim,
+                is_first=False,
+                omega_0=omega_0,
+            ),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+        # 2. Parameter-Agnostic z-Gate
+        self.z_gate = nn.Sequential(
+            nn.Linear(1 + param_dim, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+
+        # 3. Explicit Localized Gabor Stream
+        self.freq_linear = nn.Linear(in_dim, hidden_dim)
+
+        self.center_net = nn.Linear(param_dim, hidden_dim)
+        self.width_net = nn.Linear(param_dim, hidden_dim)
+
+        self.transient_head = nn.Linear(hidden_dim, output_dim)
+        self.omega_0 = omega_0
+
+        self.init_weights()
+
+    def init_weights(self) -> None:
+        with torch.no_grad():
+            # Standard SIREN bound for frequency linear layer
+            bound = np.sqrt(6.0 / self.freq_linear.in_features) / self.omega_0
+            self.freq_linear.weight.uniform_(-bound, bound)
+            self.freq_linear.bias.uniform_(-bound, bound)
+
+            # Center Gabor envelopes across the actual z domain
+            nn.init.uniform_(self.center_net.bias, -2.0, 6.0)
+            nn.init.zeros_(self.center_net.weight)
+
+            # Set initial widths to ~1.0 unit in raw z-space
+            nn.init.constant_(self.width_net.bias, 0.2)
+            nn.init.zeros_(self.width_net.weight)
+
+            head_bound = np.sqrt(6.0 / self.transient_head.in_features) / self.omega_0
+            self.transient_head.weight.uniform_(-head_bound, head_bound)
+            if self.transient_head.bias is not None:
+                self.transient_head.bias.zero_()
+
+    @override
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = x[:, 2:3]
+        params = x[:, 3:]
+
+        # A. Asymptotic Plateau Stream
+        spatial_inputs = torch.cat([x[:, :2], params], dim=-1)
+        c_persistent = self.persistent_net(spatial_inputs)
+
+        # B. Parameter-Agnostic Gate
+        z_and_params = torch.cat([z, params], dim=-1)
+        gate = torch.sigmoid(self.z_gate(z_and_params))
+
+        # C. Explicit Center-Width Gabor Stream
+        freq = self.omega_0 * self.freq_linear(x)
+
+        centers = self.center_net(params)
+        widths = torch.nn.functional.softplus(self.width_net(params)) + 0.2
+
+        envelope = torch.exp(-0.5 * ((z - centers) / widths) ** 2)
+
+        gabor_feats = torch.sin(freq) * envelope
+        y_transient = self.transient_head(gabor_feats)
+
         return gate * c_persistent + y_transient
 
 
@@ -780,6 +854,17 @@ if __name__ == "__main__":
                 output_dim=1,
             ),
         ).load_best(),
+        ModelZooEntry(
+            name="ExplicitAsymptoticGaborNet1",
+            train=False,
+            base_path=Path("data/example_network"),
+            model=ExplicitAsymptoticGaborNet1(
+                in_dim=6,
+                hidden_dim=128,
+                omega_0=3.0,
+                output_dim=1,
+            ),
+        ).load_best(),
     ]
 
     for m in model_zoo:
@@ -791,9 +876,9 @@ if __name__ == "__main__":
         if model.stats_path.exists():
             stats = TrainingStats.load(model.stats_path)
             fig, ax = plot_loss_curves(stats)
-            fig.savefig(model.base_path / "loss_curves.pdf")
+            fig.savefig(model.base_path / model.name / "loss_curves.pdf")
 
     fig, _ = compare_model_validation_loss(model_zoo=model_zoo)
-    fig.savefig("data/15/model_validation_loss_comparison.pdf")
+    fig.savefig("data/example_network/model_validation_loss_comparison.pdf")
     fig, _ = compare_models_against_z(model_zoo=model_zoo)
-    fig.savefig("data/15/model_comparison_vs_z.pdf")
+    fig.savefig("data/example_network/model_comparison_vs_z.pdf")
