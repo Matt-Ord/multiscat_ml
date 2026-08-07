@@ -10,7 +10,7 @@ from multiscat.basis import (
     scattering_metadata_from_stacked_delta_x,
     split_scattering_metadata,
 )
-from multiscat.config import MorseScatteringCondition, momentum_from_angles
+from multiscat.config import MorseScatteringCondition, incident_k_from_angles
 from scipy.constants import angstrom as angstrom_si  # type: ignore[import-untyped]
 from scipy.constants import (  # type: ignore[import-untyped]
     electron_volt,
@@ -149,7 +149,7 @@ class ScatteringParams:
             mass=HELIUM_MASS,
             morse_parameters=morse_params,
             metadata=metadata,
-            incident_k=momentum_from_angles(
+            incident_k=incident_k_from_angles(
                 theta=self.theta,
                 phi=self.phi,
                 energy=self.energy * electron_volt * 10**-3,
@@ -458,7 +458,7 @@ def test() -> None:
             ),
             (15, 15, 200),
         ),
-        incident_k=momentum_from_angles(
+        incident_k=incident_k_from_angles(
             theta=np.deg2rad(30),
             phi=np.deg2rad(0),
             energy=20 * electron_volt * 10**-3,

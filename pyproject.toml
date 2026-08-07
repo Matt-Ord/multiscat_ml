@@ -47,9 +47,23 @@ unfixable = ["print"]
 
 
 [tool.ruff.lint.extend-per-file-ignores]
-"tests/**/*" = ["no-self-use", "too-many-locals", "undocumented-public-class", "undocumented-public-method", "undocumented-public-function", "undocumented-public-package"]
+"tests/**/*" = [
+    "no-self-use",
+    "too-many-locals",
+    "undocumented-public-class",
+    "undocumented-public-method",
+    "undocumented-public-function",
+    "undocumented-public-package",
+]
 "examples/**/*" = ["implicit-namespace-package", "print"]
-"scripts/**/*" = ["implicit-namespace-package", "print", "undocumented-public-class", "undocumented-public-method", "undocumented-public-function", "undocumented-public-package"]
+"scripts/**/*" = [
+    "implicit-namespace-package",
+    "print",
+    "undocumented-public-class",
+    "undocumented-public-method",
+    "undocumented-public-function",
+    "undocumented-public-package",
+]
 "docs/**/*" = ["implicit-namespace-package", "missing-required-import"]
 
 [tool.ruff.lint.pylint]
@@ -81,7 +95,7 @@ reportUnknownMemberType = false
 include = ["multiscat_ml", "multiscat_ml.*"]
 
 [tool.uv.sources]
-multiscat = { git = "https://github.com/Matt-Ord/multiscat.git" }
+multiscat = { git = "https://github.com/Matt-Ord/multiscat.git", rev = "4e530d80d5dc0cc1b81e5c2794ce355c030d42b8" }
 
 
 [build-system]

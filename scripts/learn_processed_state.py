@@ -1,5 +1,4 @@
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import override
 
@@ -13,39 +12,42 @@ from multiscat.basis import (
     scattering_metadata_from_stacked_delta_x,
     split_scattering_metadata,
 )
-from multiscat.config import MorseScatteringCondition, momentum_from_angles
+from multiscat.config import (
+    MorseScatteringCondition,
+    UnitSystem,
+    condition_in_natural_units,
+    get_condition_natural_units,
+    incident_k_from_angles,
+)
 from multiscat.multiscat import (
-    _as_natural_units,
+    get_full_b_wave,
     get_preconditioned_state_from_state,
     get_scattering_state,
 )
-from multiscat.multiscat._util import (
-    get_a_wave_full_for_condition,
-    get_b_wave_full_for_condition,
-)
-from scipy.constants import angstrom as angstrom_si  # type: ignore[import-untyped]
 from scipy.constants import (  # type: ignore[import-untyped]
-    atomic_mass,
+    angstrom,
     electron_volt,
     physical_constants,
 )
+from scipy.constants import angstrom as angstrom_si  # type: ignore[import-untyped]
 from slate_core import (
     Array,
     basis,
-    metadata,
     plot,
 )
 from slate_core.basis import AsUpcast
 from slate_core.metadata import (
+    Domain,
     LobattoSpacedLengthMetadata,
 )
-from slate_core.metadata._spaced import Domain
+from slate_core.metadata.volume import fundamental_stacked_delta_x
 from slate_quantum import operator
 from torch import nn, optim
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
 from tqdm import tqdm
 
 from multiscat_ml import plot_loss_curves
+from multiscat_ml.model_zoo import ModelZooEntry, compare_model_validation_loss
 from multiscat_ml.utils import (
     TrainingStats,
 )
@@ -54,17 +56,6 @@ from multiscat_ml.utils import (
 HELIUM_MASS = physical_constants["alpha particle mass"][0]
 HELIUM_ENERGY = 7 * electron_volt * 10**-3
 Z_HEIGHT = 8
-Nx, Ny, Nz = 15, 15, 100
-
-
-@dataclass(kw_only=True, frozen=True)
-class ModelZooEntry:
-    """Entry in model_zoo containing training/loading flags, base path, and PyTorch model."""
-
-    train: bool = False
-    load: bool = True
-    base_path: Path
-    model: nn.Module
 
 
 if torch.cuda.is_available():
@@ -75,13 +66,19 @@ else:
     DEVICE = torch.device("cpu")  # pyright: ignore[reportConstantRedefinition]
 
 PARAMS_MIN = np.array(
-    [0.5, 5.0, 0.5, 0.0, 0.02, 6, 0.0, 0.0, 2, 3],
+    [0.1],
     dtype=np.float64,
 )
 PARAMS_MAX = np.array(
-    [4, 10.0, 1.5, 4.0, 0.20, 10, np.pi / 2, 2 * np.pi, 40, 10],
+    [2.0],
     dtype=np.float64,
 )
+
+HELIUM_MASS = physical_constants["alpha particle mass"][0]
+HELIUM_ENERGY = 20 * electron_volt * 10**-3
+
+UNIT_CELL = 2.84 * angstrom
+Z_HEIGHT = 8 * angstrom
 
 
 def denormalize_params(
@@ -91,52 +88,67 @@ def denormalize_params(
     return params_norm * (PARAMS_MAX - PARAMS_MIN) + PARAMS_MIN
 
 
+def get_stable_state(
+    condition: MorseScatteringCondition,
+    config: OptimizationConfig,
+) -> np.ndarray[tuple[int, int, int], np.dtype[np.complex128]]:
+    """Simulate the preconditioned state from the given ScatteringCondition."""
+    converted_condition = condition_in_natural_units(condition)
+    b = get_full_b_wave(
+        converted_condition.metadata,
+        converted_condition.incident_k,
+    )
+
+    # Get the scattering state
+    state = get_scattering_state(condition, config)
+
+    # Get the preconditioned state
+    preconditioned_state = get_preconditioned_state_from_state(
+        state,
+        condition,
+        n_channels=config.n_channels,
+    )
+
+    # Return the real and imaginary parts of the preconditioned state
+    preconditioned_data = preconditioned_state.with_basis(
+        close_coupling_basis(condition.metadata),
+    ).raw_data.reshape(condition.metadata.shape)
+    return 2.0j * b * preconditioned_data
+
+
 def condition_from_params(
     params: np.ndarray[tuple[int], np.dtype[np.float64]],
 ) -> MorseScatteringCondition:
     """Convert a tensor of parameters into a ScatteringCondition."""
-    (
-        a,
-        depth,
-        height,
-        offset,
-        beta,
-        z_height,
-        theta,
-        phi,
-        energy,
-        mass,
-    ) = denormalize_params(
-        params,
-    )
+    (energy_factor,) = denormalize_params(params)
 
-    morse_params = operator.build.CorrugatedMorseParameters(
-        depth=depth * electron_volt * 10**-3,
-        height=height * angstrom_si,
-        offset=offset * angstrom_si,
-        beta=beta,
+    morse_parameters = operator.build.CorrugatedMorseParameters(
+        depth=7.63 * electron_volt * 10**-3,
+        height=0.91 * angstrom,
+        offset=3.0 * angstrom,
+        beta=0.10,
     )
 
     metadata = scattering_metadata_from_stacked_delta_x(
         (
-            np.array([a * angstrom_si, 0, 0]),
-            np.array([0, a * angstrom_si, 0]),
-            np.array([0, 0, z_height * angstrom_si]),
+            np.array([UNIT_CELL / np.sqrt(2), 0, 0]),
+            np.array([UNIT_CELL / np.sqrt(8), np.sqrt(3) * UNIT_CELL / np.sqrt(8), 0]),
+            np.array([0, 0, Z_HEIGHT]),
         ),
-        (Nx, Ny, Nz),
+        (18, 18, 200),
     )
-
-    return MorseScatteringCondition(
-        mass=mass * atomic_mass,
-        morse_parameters=morse_params,
+    condition = MorseScatteringCondition(
+        mass=3 * HELIUM_MASS,
+        incident_k=incident_k_from_angles(
+            mass=3 * HELIUM_MASS,
+            energy=HELIUM_ENERGY * energy_factor,
+            theta=np.deg2rad(30),
+            phi=np.deg2rad(60),
+        ),
         metadata=metadata,
-        incident_k=momentum_from_angles(
-            theta=theta,
-            phi=phi,
-            energy=energy * electron_volt * 10**-3,
-            mass=mass * atomic_mass,
-        ),
+        morse_parameters=morse_parameters,
     )
+    return condition.with_units(get_condition_natural_units(condition))
 
 
 def normalize_params(
@@ -150,88 +162,71 @@ def params_from_condition(
     condition: MorseScatteringCondition,
 ) -> np.ndarray[tuple[int], np.dtype[np.float64]]:
     """Extract the parameters from a ScatteringCondition."""
-    metadata_x01, metadata_z = split_scattering_metadata(condition.metadata)
-    z_height = metadata_z.domain.delta / angstrom_si
+    condition = condition.with_units(UnitSystem())
 
-    a = metadata.volume.fundamental_stacked_delta_x(metadata_x01)[0][0] / angstrom_si
-
-    morse_parameters = condition.morse_parameters
-
-    depth = morse_parameters.depth / (electron_volt * 10**-3)
-    height = morse_parameters.height / angstrom_si
-    offset = morse_parameters.offset / angstrom_si
-    beta = morse_parameters.beta
-
-    theta = condition.theta
-    phi = condition.phi
-    energy = condition.incident_energy / (electron_volt * 10**-3)
-    mass = condition.mass / atomic_mass
-
-    return normalize_params(
-        np.array(
-            [
-                a,
-                depth,
-                height,
-                offset,
-                beta,
-                z_height,
-                theta,
-                phi,
-                energy,
-                mass,
-            ],
-        ),
-    )
+    energy = condition.incident_energy / HELIUM_ENERGY
+    return normalize_params(np.array([energy]))
 
 
-def simulate_preconditioned_state_from_condition(
-    condition: MorseScatteringCondition,
-) -> torch.Tensor:
-    """Simulate the preconditioned state from the given ScatteringCondition."""
-    config = OptimizationConfig(precision=1e-5, max_iterations=1000, n_channels=625)
-    morse_parameters = condition.morse_parameters
-    _offset, _depth = morse_parameters.offset, morse_parameters.depth
-    converted_condition = _as_natural_units(condition)
-    b = get_b_wave_full_for_condition(
-        converted_condition.metadata, converted_condition.incident_k
-    )
-
-    a_full = get_a_wave_full_for_condition(
-        converted_condition.metadata, converted_condition.incident_k
-    )
-
-    a = np.zeros(converted_condition.metadata.shape, dtype=np.complex128)
-    a[0, 0, :] = a_full[0, 0, :]
-
-    # Get the scattering state
-    state = get_scattering_state(condition, config)
-
-    # Get the preconditioned state
-    preconditioned_state = get_preconditioned_state_from_state(
-        state, condition, n_channels=config.n_channels
-    )
-
-    # Return the real and imaginary parts of the preconditioned state
-    preconditioned_data = preconditioned_state.with_basis(
-        close_coupling_basis(condition.metadata)
-    ).raw_data.reshape(condition.metadata.shape)
-    stabilized = a + 2.0j * b * preconditioned_data
-
-    return torch.from_numpy(
-        np.stack((stabilized.real, stabilized.imag), axis=0)
-    ).float()
-
-
-def simulate_preconditioned_state(
+def simulate_stable_state(
     params: np.ndarray[tuple[int], np.dtype[np.float64]],
-) -> torch.Tensor:
-    """Simulate the preconditioned state from the given parameters."""
+    *,
+    n_samples_per_slice: int = 100,
+) -> tuple[
+    np.ndarray[tuple[int], np.dtype[np.complex128]],
+    np.ndarray[tuple[int, int], np.dtype[np.floating]],
+]:
+    """Simulate the stable state from the given parameters."""
     condition = condition_from_params(params)
-    return simulate_preconditioned_state_from_condition(condition)
+    config = OptimizationConfig(precision=1e-5, max_iterations=1000, n_channels=160)
+    state_k_space = get_stable_state(condition, config)
+
+    metadata_x01, metadata_z = split_scattering_metadata(condition.metadata)
+
+    delta_x0, delta_x1 = fundamental_stacked_delta_x(metadata_x01)
+
+    n_kx, n_ky, n_z = state_k_space.shape
+
+    # 1. Sample fractional coordinates u, v in [0, 1) for all z slices in one step
+    rng = np.random.default_rng()
+    u = rng.uniform(0.0, 1.0, size=(n_z, n_samples_per_slice))
+    v = rng.uniform(0.0, 1.0, size=(n_z, n_samples_per_slice))
+
+    # 2. Compute physical (x, y, z) spatial positions
+    x = u * delta_x0[0] + v * delta_x1[0]
+    y = u * delta_x0[1] + v * delta_x1[1]
+    z = np.broadcast_to(metadata_z.values[:, None], (n_z, n_samples_per_slice))
+
+    coords_out = np.stack([x.ravel(), y.ravel(), z.ravel()], axis=0)
+
+    # 3. Compute reciprocal lattice vectors B = 2*pi * (A^-1)^T
+    dk_stacked = 2 * np.pi * np.linalg.inv(np.column_stack([delta_x0, delta_x1])).T
+
+    # 4. Construct wavevector grid (kx, ky) in reciprocal space
+    m_freq = np.fft.fftfreq(n_kx) * n_kx
+    n_freq = np.fft.fftfreq(n_ky) * n_ky
+
+    kx = m_freq[:, None] * dk_stacked[0, 0] + n_freq[None, :] * dk_stacked[0, 1]
+    ky = m_freq[:, None] * dk_stacked[1, 0] + n_freq[None, :] * dk_stacked[1, 1]
+
+    # 5. Calculate (k dot x) explicitly via broadcasting: shape (n_kx, n_ky, n_z, 100)
+    k_dot_x = (
+        kx[:, :, None, None] * x[None, None, :, :]
+        + ky[:, :, None, None] * y[None, None, :, :]
+    )
+
+    # 6. Evaluate sum_{k} state(k) * exp(i * k dot x) normalized by grid size
+    state_4d = state_k_space[:, :, :, None]
+    sampled_state = np.sum(state_4d * np.exp(1j * k_dot_x), axis=(0, 1))
+
+    state_out = sampled_state.ravel()
+
+    return state_out, coords_out
 
 
-def generate_dataset_hdf5(filepath: Path, num_samples: int = 500) -> None:
+def generate_dataset_hdf5(
+    filepath: Path, num_samples: int = 500, n_samples_per_slice: int = 100
+) -> None:
     """Generate parameters and Preconditioned state, saving them directly to disk."""
     filepath.parent.mkdir(parents=True, exist_ok=True)
     if filepath.exists():
@@ -243,278 +238,165 @@ def generate_dataset_hdf5(filepath: Path, num_samples: int = 500) -> None:
     )
     rng = np.random.default_rng()
 
-    # Open an HDF5 file in write mode
     with h5py.File(filepath, "w") as f:
-        # Fixed-size inputs
-        x_ds = f.create_dataset("X", shape=(num_samples, 10), dtype=np.float64)
+        # Generate the first sample to inspect output dimensions dynamically
+        # Note: we currently assume a fixed nz = 200
+        n_points = 200 * n_samples_per_slice
 
-        # Variable-size outputs go in a group
-        y_ds = f.create_dataset(
-            "Y", shape=(num_samples, 2, Nx, Ny, Nz), dtype=np.float32
-        )
+        # Inputs (x, y, z, energy_factor) for each sampled condition and coordinate
+        x_ds = f.create_dataset("X", shape=(num_samples, n_points, 4), dtype=np.float64)
+
+        # Outputs (real, imag) of the sampled state at each coordinate
+        y_ds = f.create_dataset("Y", shape=(num_samples, n_points, 2), dtype=np.float32)
+
         for i in range(num_samples):
             print(f"Generating sample {i + 1}/{num_samples}")
 
-            params = rng.uniform(size=10)
-            x_ds[i] = params
-            y_ds[i] = simulate_preconditioned_state(params)
+            params = rng.uniform(size=1)
+            state, coords = simulate_stable_state(
+                params, n_samples_per_slice=n_samples_per_slice
+            )
+
+            energies = np.full((n_points, 1), params[0])
+            x_ds[i] = np.hstack([coords.T, energies])
+
+            # Store real and imaginary parts as (N, 2) in float32
+            y_ds[i] = np.column_stack([state.real, state.imag]).astype(np.float32)
 
 
 class HDF5ScatteringDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
-    """An optimized Dataset that preloads scattering data completely into RAM."""
+    """PyTorch Dataset wrapper for reading (X, Y) pairs from a scattering HDF5 file."""
 
     def __init__(self, filepath: Path) -> None:
         self.filepath = filepath
+        self._file = None
 
-        # Open, read everything into RAM instantly, and close immediately
-        with h5py.File(name=filepath, mode="r") as f:
-            print(f"--> Preloading {filepath.name} entirely into system RAM...")
-            # Loading full arrays into memory
-            X_raw = torch.from_numpy(f["X"][:]).float()
-            Y_raw = torch.from_numpy(f["Y"][:]).float()
-
-        Y_complex = torch.complex(
-            Y_raw[:, 0, ...], Y_raw[:, 1, ...]
-        )  # Shape: (B, Nx, Ny, Nz)
-
-        print("--> Computing 2D Fourier Transform over the x-y plane...")
-        # 3. Perform 2D FFT over the kx (dim=1) and ky (dim=2) dimensions
-        # We shift low frequencies to the center using fftshift for physical correctness
-        Y_ifft = (
-            torch.fft.ifft2(Y_complex, s=(Nx * 5, Ny * 5), dim=(1, 2)) * Nx * Ny * 25
-        )
-
-        # 4. Pack it back into a split Real/Imaginary view if your SIREN model expects 2 channels
-        self.Y_data = torch.stack(
-            [Y_ifft.real, Y_ifft.imag], dim=1
-        )  # Shape: (B, 2, Nx, Ny, Nz)
-        self.X_data = X_raw
-
-        self.length = self.X_data.shape[0]
-        print(f"--> Caching complete! Loaded {self.length} samples.")
+        # Inspect length during initialization
+        with h5py.File(self.filepath, "r") as f:
+            self._length = len(f["X"])
 
     def __len__(self) -> int:
-        return self.length
+        return self._length
 
-    def __getitem__(self, index: int):
-        # Fast RAM slice—no disk reading overhead!
-        return (
-            self.X_data[index],
-            self.Y_data[index],
-        )
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:  # ty: ignore[invalid-method-override]
+        # Lazy file loading avoids HDF5 file-handle serialization issues with DataLoader workers
+        if self._file is None:
+            self._file = h5py.File(self.filepath, "r")
+
+        x_arr = self._file["X"][idx]
+        y_arr = self._file["Y"][idx]
+
+        # Convert to float32 tensors for PyTorch model compatibility
+        x_tensor = torch.from_numpy(x_arr).to(torch.float32)
+        y_tensor = torch.from_numpy(y_arr).to(torch.float32)
+
+        return x_tensor, y_tensor
+
+    def __del__(self) -> None:
+        if self._file is not None:
+            self._file.close()
 
 
 def generate() -> None:
     for i in range(50):
-        data_path = Path(f"data/15/env_stabilized_data_{i}.hdf5")
+        data_path = Path(f"data/15/stable_state_data_{i}.hdf5")
         generate_dataset_hdf5(data_path, num_samples=500)
 
 
 def load_datasets() -> ConcatDataset[tuple[torch.Tensor, torch.Tensor]]:
     datasets = [
-        HDF5ScatteringDataset(Path(f"data/15/env_stabilized_data_{i}.hdf5"))
+        HDF5ScatteringDataset(Path(f"data/15/stable_state_data_{i}.hdf5"))
         for i in range(50)
     ]
     return ConcatDataset[tuple[torch.Tensor, torch.Tensor]](datasets)
 
 
-class _SineLayer(nn.Module):
+class SirenLayer(nn.Module):
     def __init__(
         self,
         in_features: int,
         out_features: int,
-        is_first: bool = False,
-        omega_0: float = 30.0,
+        is_first: bool = False,  # ruff: ignore[boolean-default-value-positional-argument, boolean-type-hint-positional-argument]
+        omega_0: float = 5.0,
     ) -> None:
         super().__init__()
+
         self.linear = nn.Linear(in_features, out_features)
-        self.is_first = is_first
         self.omega_0 = omega_0
+        self.is_first = is_first
+
         self.init_weights()
 
     def init_weights(self) -> None:
         with torch.no_grad():
             if self.is_first:
-                bound = 1.0 / self.linear.in_features
+                bound = 1 / self.linear.in_features
             else:
-                bound = np.sqrt(6.0 / self.linear.in_features) / self.omega_0
+                bound = np.sqrt(6 / self.linear.in_features) / self.omega_0
 
             self.linear.weight.uniform_(-bound, bound)
-            if self.linear.bias is not None:
-                self.linear.bias.uniform_(-bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.sin(self.omega_0 * self.linear(x))
 
 
-def align_params_to_coords(
-    params: torch.Tensor,
-    coords: torch.Tensor,
-    *,
-    param_dim: int,
-    coord_dim: int,
-) -> torch.Tensor:
-    """
-    Align parameter rows with coordinate rows.
-
-    Supported shapes:
-        params: (N, param_dim), coords: (N, coord_dim)
-        params: (1, param_dim), coords: (N, coord_dim)
-        params: (B, param_dim), coords: (B * N_pts, coord_dim)
-
-    For flattened batched coordinates, points must be grouped by sample.
-    """
-    if params.ndim != 2:
-        msg = f"params must be 2D, but received shape {tuple(params.shape)}."
-        raise ValueError(msg)
-
-    if coords.ndim != 2:
-        msg = f"coords must be 2D, but received shape {tuple(coords.shape)}."
-        raise ValueError(msg)
-
-    if params.shape[-1] != param_dim:
-        msg = (
-            f"Expected params.shape[-1] == {param_dim}, "
-            f"but received {params.shape[-1]}."
-        )
-        raise ValueError(msg)
-
-    if coords.shape[-1] != coord_dim:
-        msg = (
-            f"Expected coords.shape[-1] == {coord_dim}, "
-            f"but received {coords.shape[-1]}."
-        )
-        raise ValueError(msg)
-
-    num_param_rows = params.shape[0]
-    num_coord_rows = coords.shape[0]
-
-    if num_param_rows == num_coord_rows:
-        return params
-
-    if num_param_rows == 1:
-        return params.expand(num_coord_rows, -1)
-
-    if num_coord_rows % num_param_rows == 0:
-        points_per_sample = num_coord_rows // num_param_rows
-        return params.repeat_interleave(points_per_sample, dim=0)
-
-    msg = (
-        "Could not align params and coords. "
-        f"Received {num_param_rows} parameter rows and "
-        f"{num_coord_rows} coordinate rows."
-    )
-    raise ValueError(msg)
-
-
-class ExplicitAsymptoticSirenNet(nn.Module):
-    """
-    Persistent + Transient SIREN representation.
-
-    Learns
-
-        f(params, x, y, z)
-            = persistent(params, x, y)
-            + gate(z, params) * transient(params, x, y, z)
-
-    where
-
-        persistent -> a
-        transient * gate  -> 2ib^T (Y-c)^-1 b
-        gate       -> smooth transition into the asymptotic regime
-    """
-
-    def __init__(
+class PureSIREN(nn.Module):
+    def __init__(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
         self,
-        param_dim: int = 10,
-        coord_dim: int = 3,
-        hidden_dim: int = 64,
-        transient_hidden_dim: int = 64,
-        gate_hidden_dim: int = 64,
-        output_dim: int = 2,
-        omega_0: float = 10.0,
+        in_dim: int = 6,
+        param_dim: int | None = None,
+        coord_dim: int = 0,
+        hidden_dim: int = 256,
+        num_layers: int = 6,
+        first_omega_0: float = 5.0,
+        hidden_omega_0: float = 5.0,
+        output_dim: int = 1,
     ) -> None:
         super().__init__()
 
-        if coord_dim != 3:
-            msg = "coord_dim must be 3."
-            raise ValueError(msg)
+        if param_dim is not None:
+            in_dim = param_dim + coord_dim if coord_dim > 0 else param_dim
 
-        self.param_dim = param_dim
-        self.coord_dim = coord_dim
-        self.output_dim = output_dim
+        self.in_dim = in_dim
+        self.hidden_omega_0 = hidden_omega_0
 
-        # -------------------------
-        # Persistent branch
-        # -------------------------
-        self.persistent_net = nn.Sequential(
-            _SineLayer(
-                in_features=2 + param_dim,
+        layers = [
+            SirenLayer(
+                in_features=self.in_dim,
                 out_features=hidden_dim,
                 is_first=True,
-                omega_0=omega_0,
-            ),
-            nn.Linear(hidden_dim, output_dim),
-        )
+                omega_0=first_omega_0,
+            )
+        ]
 
-        # -------------------------
-        # Transient branch
-        # -------------------------
-        self.transient_net = nn.Sequential(
-            _SineLayer(
-                in_features=coord_dim + param_dim,
-                out_features=transient_hidden_dim,
-                is_first=True,
-                omega_0=omega_0,
-            ),
-            _SineLayer(
-                transient_hidden_dim,
-                transient_hidden_dim,
+        layers.extend(
+            SirenLayer(
+                in_features=hidden_dim,
+                out_features=hidden_dim,
                 is_first=False,
-                omega_0=omega_0,
-            ),
-            nn.Linear(transient_hidden_dim, output_dim),
+                omega_0=hidden_omega_0,
+            )
+            for _ in range(num_layers - 1)
         )
 
-        # -------------------------
-        # Transition gate
-        # -------------------------
-        self.z_gate = nn.Sequential(
-            nn.Linear(1 + param_dim, gate_hidden_dim),
-            nn.GELU(),
-            nn.Linear(gate_hidden_dim, 1),
-        )
+        self.net = nn.ModuleList(layers)
+        self.head = nn.Linear(hidden_dim, output_dim)
+        self.init_head()
+
+    def init_head(self) -> None:
+        with torch.no_grad():
+            bound = np.sqrt(6.0 / self.head.in_features) / self.hidden_omega_0
+            self.head.weight.uniform_(-bound, bound)
+            if self.head.bias is not None:
+                self.head.bias.zero_()
 
     @override
-    def forward(
-        self,
-        params: torch.Tensor,
-        coords: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
 
-        params = align_params_to_coords(
-            params,
-            coords,
-            param_dim=self.param_dim,
-            coord_dim=self.coord_dim,
-        )
+        for layer in self.net:
+            x = layer(x)
 
-        xy = coords[:, :2]
-        z = coords[:, 2:3]
-
-        # Persistent asymptotic component
-        persistent_inputs = torch.cat([xy, params], dim=-1)
-        y_persistent = self.persistent_net(persistent_inputs)
-
-        # Transient component
-        transient_inputs = torch.cat([coords, params], dim=-1)
-        y_transient = self.transient_net(transient_inputs)
-
-        # Learned transition
-        gate_inputs = torch.cat([z, params], dim=-1)
-        gate = torch.sigmoid(self.z_gate(gate_inputs))
-
-        return y_persistent + gate * y_transient
+        return self.head(x)
 
 
 def _make_coords(
@@ -579,248 +461,111 @@ def predict_chi_batch_from_params(
 
 
 def train_model(  # ruff: ignore[too-many-locals, too-many-statements]
-    model: nn.Module,
-    model_name: str,
-    epochs: int = 6000,
-    max_epochs_without_improvement: int = 360,
-    output_dir: Path = Path("data/15"),
+    model_entry: ModelZooEntry,
+    epochs: int = 200,
+    max_epochs_without_improvement: int = 200,
 ) -> None:
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    model_entry.base_path.mkdir(parents=True, exist_ok=True)
 
-    model = model.to(DEVICE)
-    # noqa:
+    model = model_entry.model.to(DEVICE)
     forward_criterion = nn.MSELoss()
-    if isinstance(forward_criterion, nn.Module):
-        forward_criterion = forward_criterion.to(DEVICE)
-
-    coord_ext = _make_coords(
-        Nx * 5, Ny * 5, Nz, device=DEVICE, dtype=torch.float32
-    ).view(5 * Nx, 5 * Ny, Nz, 3)
-
-    forward_optimizer = optim.AdamW(
-        model.parameters(),
-        lr=1e-4,
-        weight_decay=1e-5,
+    forward_optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        forward_optimizer, mode="min", factor=0.5, patience=5
     )
-
-    scheduler_f = optim.lr_scheduler.ReduceLROnPlateau(
-        forward_optimizer,
-        mode="min",
-        factor=0.5,
-        patience=5,
-    )
-
-    dataset = load_datasets()
-    train_dataset, val_dataset = random_split(dataset, [0.8, 0.2])
-
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
-
-    stats_path = output_dir / f"{model_name}_training_stats.pkl"
-    best_model_path = output_dir / f"{model_name}_best.pth"
-    final_model_path = output_dir / f"{model_name}_final.pth"
-    curve_path = output_dir / f"{model_name}_convergence.png"
 
     stats = TrainingStats()
-
     best_val_loss = float("inf")
     epochs_without_improvement = 0
 
-    print(
-        f"Training on {len(train_dataset)} samples, validating on {len(val_dataset)} samples..."
-    )
-    print(f"Using device: {DEVICE}")
+    # Load multi-file dataset directly from disk
+    full_dataset = load_datasets()
+    train_dataset, val_dataset = random_split(full_dataset, [0.8, 0.2])
 
-    val_sx = slice(2 * Nx, 3 * Nx)
-    val_sy = slice(2 * Ny, 3 * Ny)
+    train_loader = DataLoader(
+        train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True
+    )
 
     for epoch in range(epochs):
-        # Ramp alpha from 0 to 1 after switch_epoch.
+        epoch_start = time.perf_counter()
         model.train()
-        forward_criterion.train()
-
-        # ------------------------------------------------------------------
-        # Training
-        # ------------------------------------------------------------------
         train_loss = 0.0
+        current_lr = forward_optimizer.param_groups[0]["lr"]
 
-        train_bar = tqdm(
+        p_bar = tqdm(
             train_loader,
             desc=f"Epoch {epoch + 1}/{epochs}",
             unit="batch",
         )
 
-        for batch_idx, (
-            params_batch,
-            target_batch,
-        ) in enumerate(train_bar):
+        for batch_idx, (batch_parameters, batch_targets) in enumerate(p_bar):
             forward_optimizer.zero_grad(set_to_none=True)
 
-            t0 = time.perf_counter()
-            sx, sy = sample_crop(
-                Nx_ext=5 * Nx,
-                Ny_ext=5 * Ny,
-                Nx=Nx,
-                Ny=Ny,
-                device=DEVICE,
-            )
-
-            coord = coord_ext[sx, sy].reshape(-1, 3)
-
-            target = target_batch[:, :, sx, sy, :]
-
-            prediction = predict_chi_batch_from_params(
-                forward_model=model,
-                params_batch=params_batch,
-                coords=coord,
-                Nx=Nx,
-                Ny=Ny,
-                Nz=Nz,
-            )
-
-            t1 = time.perf_counter()
-
-            loss_all = forward_criterion(prediction, target)
-
-            loss = loss_all
-            loss.backward()
+            prediction = model(batch_parameters)
+            batch_loss = forward_criterion(prediction, batch_targets)
+            batch_loss.backward()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-            t2 = time.perf_counter()
-
             forward_optimizer.step()
 
-            t3 = time.perf_counter()
+            train_loss += batch_loss.item()
+            running_loss = train_loss / (batch_idx + 1)
 
-            train_loss += loss.item()
-            average_batch_loss = train_loss / (batch_idx + 1)
-
-            train_bar.set_postfix(
-                loss=f"{loss.item():.3e}",
-                avg=f"{average_batch_loss:.3e}",
-                pred=f"{t1 - t0:.2f}s",
-                back=f"{t2 - t1:.2f}s",
-                step=f"{t3 - t2:.2f}s",
-                lr=f"{forward_optimizer.param_groups[0]['lr']:.1e}",
+            p_bar.set_postfix(
+                loss=f"{batch_loss.item():.3e}",
+                avg=f"{running_loss:.3e}",
+                lr=f"{current_lr:.1e}",
             )
 
-        average_train_loss = train_loss / len(train_loader)
+        train_loss /= len(train_loader)
 
-        # ------------------------------------------------------------------
-        # Validation
-        # ------------------------------------------------------------------
+        # Validation step
         model.eval()
-        forward_criterion.eval()
-        val_loss = 0.0
+        validation_loss = 0.0
+        with torch.no_grad():
+            for val_params, val_targets in val_loader:
+                prediction = model(val_params)
+                validation_loss += forward_criterion(prediction, val_targets).item()
 
-        val_bar = tqdm(
-            val_loader,
-            desc=f"Val {epoch + 1}/{epochs}",
-            unit="batch",
+        validation_loss /= len(val_loader)
+
+        scheduler.step(validation_loss)
+
+        current_weight_decay = float(
+            forward_optimizer.param_groups[0].get("weight_decay", 0.0)
         )
-
-        with torch.inference_mode():
-            for batch_idx, (
-                params_batch,
-                target_batch,
-            ) in enumerate(val_bar):
-                coord = coord_ext[val_sx, val_sy].reshape(-1, 3)
-
-                target = target_batch[:, :, val_sx, val_sy, :]
-
-                prediction = predict_chi_batch_from_params(
-                    forward_model=model,
-                    params_batch=params_batch,
-                    coords=coord,
-                    Nx=Nx,
-                    Ny=Ny,
-                    Nz=Nz,
-                )
-
-                loss_all = forward_criterion(prediction, target)
-                batch_val_loss = (loss_all).item()
-
-                val_loss += batch_val_loss
-                average_batch_val_loss = val_loss / (batch_idx + 1)
-
-                val_bar.set_postfix(
-                    loss=f"{batch_val_loss:.3e}",
-                    avg=f"{average_batch_val_loss:.3e}",
-                )
-
-        average_val_loss = val_loss / len(val_loader)
-
-        # ------------------------------------------------------------------
-        # Epoch bookkeeping
-        # ------------------------------------------------------------------
-        current_weight_decay = forward_optimizer.param_groups[0].get(
-            "weight_decay",
-            0.0,
-        )
-
         stats.append(
-            train_loss=average_train_loss,
-            val_loss=average_val_loss,
+            train_loss=train_loss,
+            val_loss=validation_loss,
             weight_decay=current_weight_decay,
         )
-        stats.save(stats_path)
+        stats.save(model_entry.stats_path)
 
-        scheduler_f.step(average_val_loss)
-
-        current_lr = forward_optimizer.param_groups[0]["lr"]
-
+        epoch_time = time.perf_counter() - epoch_start
         print(
-            f"Epoch {epoch + 1:03d}/{epochs} | "
-            f"Fwd Loss (Tr/Val): "
-            f"{average_train_loss:.2e} / {average_val_loss:.2e} | "
-            f"LR: {current_lr:.1e}"
+            f"Epoch {epoch + 1:03d} done | train_loss={train_loss:.6e} | "
+            f"val_loss={validation_loss:.6e} | best_val={best_val_loss:.6e} | time={epoch_time:.2f}s"
         )
-        # ------------------------------------------------------------------
-        # Best checkpoint and early stopping
-        # ------------------------------------------------------------------
-        if average_val_loss < best_val_loss:
-            best_val_loss = average_val_loss
-            epochs_without_improvement = 0
 
-            torch.save(
-                model.state_dict(),
-                best_model_path,
-            )
+        if validation_loss < best_val_loss:
+            best_val_loss = validation_loss
+            epochs_without_improvement = 0
+            torch.save(model.state_dict(), model_entry.best_model_path)
+            print("✓ Saved new best model checkpoint.")
         else:
             epochs_without_improvement += 1
 
         if epochs_without_improvement >= max_epochs_without_improvement:
-            print(
-                "Early stopping triggered after "
-                f"{epochs_without_improvement} epochs without improvement."
-            )
+            print(f"Early stopping triggered at epoch {epoch + 1}")
             break
 
-    # ----------------------------------------------------------------------
-    # Final outputs
-    # ----------------------------------------------------------------------
-    torch.save(
-        model.state_dict(),
-        final_model_path,
-    )
-
-    stats.save(stats_path)
-
-    fig, _ = plot_loss_curves(stats)
-    fig.savefig(
-        curve_path,
-        dpi=300,
-        bbox_inches="tight",
-    )
-    plt.close(fig)
-
-    print("Training complete.")
-    print(f"Best validation loss: {best_val_loss:.3e}")
-    print(f"Saved training statistics to: {stats_path}")
-    print(f"Saved convergence curve to: {curve_path}")
-    print(f"Saved final model to: {final_model_path}")
+    # Save artifacts
+    stats.save(model_entry.stats_path)
+    torch.save(model.state_dict(), model_entry.final_model_path)
 
 
 def plot_slice_pair(
@@ -907,7 +652,7 @@ def _test(
             ),
             (15, 15, 200),
         ),
-        incident_k=momentum_from_angles(
+        incident_k=incident_k_from_angles(
             theta=np.deg2rad(0),
             phi=np.deg2rad(20),
             energy=HELIUM_ENERGY,
@@ -979,8 +724,9 @@ def _test(
         )
 
         predicted_state_data = k_space_complex.cpu().numpy()
-
-    actual_state_channels = simulate_preconditioned_state(test_params)
+    config = OptimizationConfig(precision=1e-5, max_iterations=1000, n_channels=160)
+    condition = condition_from_params(test_params)
+    actual_state_channels = get_stable_state(condition, config=config)
 
     actual_k_state_data = torch.complex(
         actual_state_channels[0],
@@ -1345,7 +1091,7 @@ def _test(
 
 
 def plot_all_models_psi_00(
-    model_zoo: dict[str, ModelZooEntry],
+    model_zoo: list[ModelZooEntry],
     *,
     output_dir: Path = Path("data/15"),
 ) -> None:
@@ -1371,7 +1117,7 @@ def plot_all_models_psi_00(
             ),
             (15, 15, 200),
         ),
-        incident_k=momentum_from_angles(
+        incident_k=incident_k_from_angles(
             theta=np.deg2rad(0),
             phi=np.deg2rad(20),
             energy=HELIUM_ENERGY,
@@ -1426,7 +1172,8 @@ def plot_all_models_psi_00(
     # ------------------------------------------------------------------
     predictions: dict[str, np.ndarray] = {}
 
-    for model_name, entry in model_zoo.items():
+    for entry in model_zoo:
+        model_name = entry.name
         checkpoint_path = entry.base_path / f"{model_name}_best.pth"
 
         if not checkpoint_path.is_file():
@@ -1536,51 +1283,47 @@ def plot_all_models_psi_00(
 
 
 if __name__ == "__main__":
-    param_dim = 10
-    coord_dim = 3
-    output_dim = 2
     generate()
 
-    model_zoo: dict[str, ModelZooEntry] = {
-        "ExplicitAsymptoticSirenNet": ModelZooEntry(
-            model=ExplicitAsymptoticSirenNet(
-                param_dim=param_dim,
-                coord_dim=coord_dim,
-                hidden_dim=16,
-                omega_0=30.0,
-                output_dim=output_dim,
-            ),
-            base_path=Path("data/15/ExplicitAsymptoticSirenNet"),
+    model_zoo: list[ModelZooEntry] = [
+        ModelZooEntry(
+            name="PureSIREN",
             train=False,
-            load=False,
-        ),
-    }
+            base_path=Path("data/example_network"),
+            model=PureSIREN(
+                param_dim=4, output_dim=2, first_omega_0=1.0, hidden_omega_0=1.0
+            ),
+        ).load_best(device=DEVICE),
+    ]
 
-    for model_name, entry in model_zoo.items():
+    for m in model_zoo:
+        if m.train:
+            print(f"\n[{m.name}] Training started on device: {DEVICE}")
+            train_model(model_entry=m, epochs=1000)
+
+    for model in model_zoo:
+        if model.stats_path.exists():
+            stats = TrainingStats.load(model.stats_path)
+            fig, ax = plot_loss_curves(stats)
+            fig.savefig(model.base_path / model.name / "loss_curves.pdf")
+
+    for entry in model_zoo:
         entry.base_path.mkdir(parents=True, exist_ok=True)
 
         print(f"\n{'=' * 60}")
-        print(f"Model: {model_name}")
+        print(f"Model: {entry.name}")
         print(f"Train: {entry.train}")
-        print(f"Load:  {entry.load}")
         print(f"Path:  {entry.base_path}")
         print(f"{'=' * 60}")
 
-        if entry.train:
-            train_model(
-                model=entry.model,
-                model_name=model_name,
-                output_dir=entry.base_path,
-                epochs=1000,
-                max_epochs_without_improvement=200,
-            )
+        _test(
+            model_name=entry.name,
+            model=entry.model,
+            output_dir=entry.base_path,
+        )
 
-        if entry.load:
-            _test(
-                model_name=model_name,
-                model=entry.model,
-                output_dir=entry.base_path,
-            )
+    fig, _ = compare_model_validation_loss(model_zoo=model_zoo)
+    fig.savefig("data/example_network/model_validation_loss_comparison.pdf")
     plot_all_models_psi_00(
         model_zoo,
         output_dir=Path("data/15"),

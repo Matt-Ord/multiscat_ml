@@ -1,7 +1,6 @@
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Self, override
+from typing import TYPE_CHECKING, override
 
 import numpy as np
 import torch
@@ -11,9 +10,9 @@ from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
 
 from multiscat_ml import plot_loss_curves
+from multiscat_ml.model_zoo import ModelZooEntry, compare_model_validation_loss
 from multiscat_ml.utils import (
     TrainingStats,
-    plot_validation_loss,
 )
 
 if TYPE_CHECKING:
@@ -706,39 +705,6 @@ def get_prediction_against_z(
         return model(inputs).squeeze(-1)
 
 
-@dataclass(kw_only=True, frozen=True)
-class ModelZooEntry:
-    """Entry in model_zoo containing training/loading flags, base path, and PyTorch model."""
-
-    train: bool = False
-    base_path: Path
-    model: nn.Module
-    name: str
-
-    @property
-    def stats_path(self) -> Path:
-        return self.base_path / self.name / "training_stats.pkl"
-
-    @property
-    def best_model_path(self) -> Path:
-        return self.base_path / self.name / "best_model.pth"
-
-    @property
-    def final_model_path(self) -> Path:
-        return self.base_path / self.name / "final_model.pth"
-
-    def load_best(self) -> Self:
-        """Load the model weights from the best checkpoint if it exists."""
-        if self.best_model_path.exists():
-            self.model.load_state_dict(
-                torch.load(self.best_model_path, map_location=DEVICE)
-            )
-            print(f"Loaded model weights for {self.name}.")
-        else:
-            print(f"No best model checkpoint found for {self.name}.")
-        return self
-
-
 def compare_models_against_z(
     model_zoo: list[ModelZooEntry],
     coordinates: tuple[float, float] | None = None,
@@ -794,30 +760,6 @@ def compare_models_against_z(
     return fig, ax
 
 
-def compare_model_validation_loss(
-    model_zoo: list[ModelZooEntry],
-) -> tuple[Figure, Axes]:
-
-    fig, ax = get_figure()
-    for model in model_zoo:
-        if model.stats_path.exists():
-            stats = TrainingStats.load(model.stats_path)
-            fig, ax, line = plot_validation_loss(stats, ax=ax)
-            line.set_label(model.name)
-
-    ax.set_yscale("log")
-    ax.set_xlabel("Epochs", fontsize=12, fontweight="bold")
-    ax.set_ylabel("Validation Loss (Log Scale)", fontsize=12, fontweight="bold")
-    ax.set_title(
-        "Model Validation Loss Comparison",
-        fontsize=13,
-        fontweight="bold",
-    )
-    ax.legend(frameon=True, facecolor="white", edgecolor="none")
-
-    return fig, ax
-
-
 if __name__ == "__main__":
     model_zoo: list[ModelZooEntry] = [
         ModelZooEntry(
@@ -827,7 +769,7 @@ if __name__ == "__main__":
             model=PureSIREN(
                 param_dim=6, output_dim=1, first_omega_0=1.0, hidden_omega_0=1.0
             ),
-        ).load_best(),
+        ).load_best(device=DEVICE),
         ModelZooEntry(
             name="CondSIREN",
             train=False,
@@ -835,13 +777,13 @@ if __name__ == "__main__":
             model=ForwardCondSIRENStateModel(
                 param_dim=6, output_dim=1, first_omega_0=1.0, hidden_omega_0=1.0
             ),
-        ).load_best(),
+        ).load_best(device=DEVICE),
         ModelZooEntry(
             name="PlainMLP",
             train=False,
             base_path=Path("data/example_network"),
             model=PureMLP(param_dim=6, output_dim=1),
-        ).load_best(),
+        ).load_best(device=DEVICE),
         ModelZooEntry(
             name="ExplicitAsymptoticGaborNet",
             train=False,
@@ -853,7 +795,7 @@ if __name__ == "__main__":
                 sigma_0=1.5,
                 output_dim=1,
             ),
-        ).load_best(),
+        ).load_best(device=DEVICE),
         ModelZooEntry(
             name="ExplicitAsymptoticGaborNet1",
             train=False,
@@ -864,7 +806,7 @@ if __name__ == "__main__":
                 omega_0=3.0,
                 output_dim=1,
             ),
-        ).load_best(),
+        ).load_best(device=DEVICE),
     ]
 
     for m in model_zoo:
