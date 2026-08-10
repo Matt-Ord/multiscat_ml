@@ -41,12 +41,6 @@ if TYPE_CHECKING:
     from pytorch_lightning.utilities.types import OptimizerLRSchedulerConfig
 
 
-# Constants
-HELIUM_MASS = physical_constants["alpha particle mass"][0]
-HELIUM_ENERGY = 7 * electron_volt * 10**-3
-Z_HEIGHT = 8
-
-
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
 elif torch.backends.mps.is_available():
@@ -54,18 +48,11 @@ elif torch.backends.mps.is_available():
 else:
     DEVICE = torch.device("cpu")  # pyright: ignore[reportConstantRedefinition]
 
-PARAMS_MIN = np.array(
-    [0.1],
-    dtype=np.float64,
-)
-PARAMS_MAX = np.array(
-    [2.0],
-    dtype=np.float64,
-)
+PARAMS_MIN = np.array([0.1], dtype=np.float64)
+PARAMS_MAX = np.array([2.0], dtype=np.float64)
 
 HELIUM_MASS = physical_constants["alpha particle mass"][0]
 HELIUM_ENERGY = 20 * electron_volt * 10**-3
-
 UNIT_CELL = 2.84 * angstrom
 Z_HEIGHT = 8 * angstrom
 
@@ -257,10 +244,10 @@ def generate_sampled_dataset_hdf5(
     with h5py.File(out_path, "w") as out_f, h5py.File(in_path, "r") as original_f:
         n_states = original_f["X"].shape[0]
         x_ds = out_f.create_dataset(
-            "X", shape=(n_points, n_points, 6), dtype=np.float64
+            "X", shape=(n_states, n_points, 6), dtype=np.float64
         )
         y_ds = out_f.create_dataset(
-            "Y", shape=(n_points, n_points, 2), dtype=np.float32
+            "Y", shape=(n_states, n_points, 2), dtype=np.float32
         )
 
         for i in range(original_f["X"].shape[0]):
@@ -375,94 +362,6 @@ def load_datasets() -> ConcatDataset[tuple[torch.Tensor, torch.Tensor]]:
     return ConcatDataset[tuple[torch.Tensor, torch.Tensor]](datasets)
 
 
-class SirenLayer(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        is_first: bool = False,  # ruff: ignore[boolean-default-value-positional-argument, boolean-type-hint-positional-argument]
-        omega_0: float = 5.0,
-    ) -> None:
-        super().__init__()
-
-        self.linear = nn.Linear(in_features, out_features)
-        self.omega_0 = omega_0
-        self.is_first = is_first
-
-        self.init_weights()
-
-    def init_weights(self) -> None:
-        with torch.no_grad():
-            if self.is_first:
-                bound = 1 / self.linear.in_features
-            else:
-                bound = np.sqrt(6 / self.linear.in_features) / self.omega_0
-
-            self.linear.weight.uniform_(-bound, bound)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sin(self.omega_0 * self.linear(x))
-
-
-class PolarSIREN(nn.Module):
-    def __init__(
-        self,
-        param_dim: int,
-        hidden_dim: int,
-        num_layers: int,
-        omega_0: float = 1.0,
-    ) -> None:
-        super().__init__()
-
-        layers = [
-            SirenLayer(
-                in_features=param_dim,
-                out_features=hidden_dim,
-                is_first=True,
-                omega_0=omega_0,
-            )
-        ]
-
-        layers.extend(
-            SirenLayer(
-                in_features=hidden_dim,
-                out_features=hidden_dim,
-                is_first=False,
-                omega_0=omega_0,
-            )
-            for _ in range(num_layers - 1)
-        )
-
-        self.net = nn.ModuleList(layers)
-
-        # Predict 2 outputs: [0] = magnitude, [1] = phase
-        self.head = nn.Linear(hidden_dim, 2)
-        self.init_head(omega_0)
-
-    def init_head(self, omega_0: float) -> None:
-        with torch.no_grad():
-            bound = np.sqrt(6.0 / self.head.in_features) / omega_0
-            self.head.weight.uniform_(-bound, bound)
-            if self.head.bias is not None:
-                self.head.bias.zero_()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for layer in self.net:
-            x = layer(x)
-
-        out = self.head(x)
-
-        # 1. Separate magnitude and phase
-        mag = torch.nn.functional.softplus(out[..., 0:1])
-        phase = out[..., 1:2]
-
-        # 2. Convert to real and imaginary
-        real = mag * torch.cos(phase)
-        imag = mag * torch.sin(phase)
-
-        return torch.cat([real, imag], dim=-1)
-
-
 class PeriodicComplexNN(nn.Module):
     def __init__(
         self,
@@ -501,11 +400,11 @@ def get_predicted_stable_state(
     v = np.linspace(0.0, 1.0, grid_shape[1], endpoint=False)
 
     cos_u_3d, sin_u_3d, cos_v_3d, sin_v_3d, z_3d = np.broadcast_arrays(
-        np.cos(2 * np.pi * u),
-        np.sin(2 * np.pi * u),
-        np.cos(2 * np.pi * v),
-        np.sin(2 * np.pi * v),
-        metadata_z.values[None, None, None, None, :],
+        np.cos(2 * np.pi * u[:, None, None]),
+        np.sin(2 * np.pi * u[:, None, None]),
+        np.cos(2 * np.pi * v[None, :, None]),
+        np.sin(2 * np.pi * v[None, :, None]),
+        metadata_z.values[None, None, :],
     )
 
     # 3. Combine coordinates and energy_factor into model input array (N_total, 4)
@@ -548,6 +447,7 @@ class ScatteringLitModule(pl.LightningModule):
         self.name = name
         self.should_train = train
         self.base_path = base_path
+        self.save_hyperparameters(ignore=["model"])
 
     @property
     def checkpoint_path(self) -> Path:
@@ -715,13 +615,7 @@ if __name__ == "__main__":
     sample_dataset()
 
     model_zoo: list[ScatteringLitModule] = [
-        # ScatteringLitModule(
-        #     name="PolarSIREN",
-        #     train=False,
-        #     base_path=Path("data/processed_state"),
-        #     model=PolarSIREN(param_dim=4, omega_0=1.0, hidden_dim=256, num_layers=6),
-        # ),
-        ScatteringLitModule.load_or_initialize_model(
+        ScatteringLitModule(
             name="PeriodicComplex",
             train=False,
             base_path=Path("data/processed_state"),

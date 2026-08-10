@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING
 
 import h5py  # type: ignore[import-untyped]
 import numpy as np
@@ -327,32 +327,22 @@ class SirenLayer(nn.Module):
         return torch.sin(self.omega_0 * self.linear(x))
 
 
-class PureSIREN(nn.Module):
-    def __init__(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
+class PolarSIREN(nn.Module):
+    def __init__(
         self,
-        in_dim: int = 6,
-        param_dim: int | None = None,
-        coord_dim: int = 0,
-        hidden_dim: int = 256,
-        num_layers: int = 6,
-        first_omega_0: float = 5.0,
-        hidden_omega_0: float = 5.0,
-        output_dim: int = 1,
+        param_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        omega_0: float = 1.0,
     ) -> None:
         super().__init__()
 
-        if param_dim is not None:
-            in_dim = param_dim + coord_dim if coord_dim > 0 else param_dim
-
-        self.in_dim = in_dim
-        self.hidden_omega_0 = hidden_omega_0
-
         layers = [
             SirenLayer(
-                in_features=self.in_dim,
+                in_features=param_dim,
                 out_features=hidden_dim,
                 is_first=True,
-                omega_0=first_omega_0,
+                omega_0=omega_0,
             )
         ]
 
@@ -361,29 +351,91 @@ class PureSIREN(nn.Module):
                 in_features=hidden_dim,
                 out_features=hidden_dim,
                 is_first=False,
-                omega_0=hidden_omega_0,
+                omega_0=omega_0,
             )
             for _ in range(num_layers - 1)
         )
 
         self.net = nn.ModuleList(layers)
-        self.head = nn.Linear(hidden_dim, output_dim)
-        self.init_head()
 
-    def init_head(self) -> None:
+        # Predict 2 outputs: [0] = magnitude, [1] = phase
+        self.head = nn.Linear(hidden_dim, 2)
+        self.init_head(omega_0)
+
+    def init_head(self, omega_0: float) -> None:
         with torch.no_grad():
-            bound = np.sqrt(6.0 / self.head.in_features) / self.hidden_omega_0
+            bound = np.sqrt(6.0 / self.head.in_features) / omega_0
             self.head.weight.uniform_(-bound, bound)
             if self.head.bias is not None:
                 self.head.bias.zero_()
 
-    @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-
         for layer in self.net:
             x = layer(x)
 
-        return self.head(x)
+        out = self.head(x)
+
+        # 1. Separate magnitude and phase
+        mag = torch.nn.functional.softplus(out[..., 0:1])
+        phase = out[..., 1:2]
+
+        # 2. Convert to real and imaginary
+        real = mag * torch.cos(phase)
+        imag = mag * torch.sin(phase)
+
+        return torch.cat([real, imag], dim=-1)
+
+
+# TODO: check we do have (x,y,z, *params)
+# TODO: re scale x and y so periodicity is [0, 1]
+class PeriodicComplexNN(nn.Module):
+    def __init__(
+        self,
+        param_dim: int,
+        hidden_dim: int = 128,
+        num_layers: int = 4,
+        num_harmonics: int = 4,
+    ) -> None:
+        super().__init__()
+        self.num_harmonics = num_harmonics
+
+        # Assumes the first 2 dimensions of x are periodic (x, y)
+        # Spatial dim = 2 coordinates * 2 (sin and cos) * num_harmonics
+        spatial_dim = 2 * 2 * num_harmonics
+        mlp_input_dim = spatial_dim + (param_dim - 2)
+
+        # MLP backbone
+        layers = []
+        layers.extend((nn.Linear(mlp_input_dim, hidden_dim), nn.GELU()))
+
+        for _ in range(num_layers - 1):
+            layers.extend((nn.Linear(hidden_dim, hidden_dim), nn.GELU()))
+
+        layers.append(nn.Linear(hidden_dim, 2))  # Predicts: [Real, Imag]
+        self.mlp = nn.Sequential(*layers)
+
+        # Frequencies for unit period (2 * pi * k * coord)
+        harmonics = torch.arange(1, num_harmonics + 1, dtype=torch.float32)
+        self.register_buffer("freqs", 2 * torch.pi * harmonics)
+
+    def _fourier_features(self, coord: torch.Tensor) -> torch.Tensor:
+        # coord shape: (..., 1)
+        # freqs shape: (num_harmonics,)
+        angles = coord * self.freqs  # (..., num_harmonics)
+        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Input x shape: (..., param_dim)
+        # x[..., 0:1] -> x coord, x[..., 1:2] -> y coord, x[..., 2:] -> remaining features (z, E, etc.)
+        fx = self._fourier_features(x[..., 0:1])
+        fy = self._fourier_features(x[..., 1:2])
+        rest = x[..., 2:]
+
+        # Concatenate spatial Fourier features with remaining dimensions
+        features = torch.cat([fx, fy, rest], dim=-1)
+
+        # Output shape: (..., 2) representing concatenated [real, imag]
+        return self.mlp(features)
 
 
 def get_predicted_stable_state(
@@ -506,7 +558,7 @@ def train_model(
     model_entry.base_path.mkdir(parents=True, exist_ok=True)
 
     full_dataset = load_datasets()
-    train_dataset, val_dataset, _ = random_split(full_dataset, [0.4, 0.1, 0.50])
+    train_dataset, val_dataset, _ = random_split(full_dataset, [0.2, 0.05, 0.75])
 
     train_loader = DataLoader(
         train_dataset, batch_size=32, shuffle=True, num_workers=0, pin_memory=False
@@ -584,17 +636,23 @@ def plot_specular_predictions(
 
 
 if __name__ == "__main__":
-    generate()
+    # generate()
 
     model_zoo: list[ScatteringLitModule] = [
         ScatteringLitModule(
-            name="PureSIREN",
-            train=True,
+            name="PolarSIREN",
+            train=False,
             base_path=Path("data/processed_state"),
-            model=PureSIREN(
-                param_dim=4, output_dim=2, first_omega_0=1.0, hidden_omega_0=1.0
+            model=PolarSIREN(param_dim=4, omega_0=1.0, hidden_dim=256, num_layers=6),
+        ),
+        ScatteringLitModule(
+            name="PeriodicComplexNN",
+            train=False,
+            base_path=Path("data/processed_state"),
+            model=PeriodicComplexNN(
+                param_dim=4, num_harmonics=15, hidden_dim=256, num_layers=6
             ),
-        )
+        ),
     ]
     for m in model_zoo:
         if m.should_train:
