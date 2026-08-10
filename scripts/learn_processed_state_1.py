@@ -30,10 +30,7 @@ from scipy.constants import (  # type: ignore[import-untyped]
     electron_volt,
     physical_constants,
 )
-from slate_core.metadata.volume import (
-    fundamental_stacked_delta_x,
-    fundamental_stacked_k_points,
-)
+from scipy.interpolate import CubicSpline
 from slate_core.plot import get_figure
 from slate_quantum import operator
 from torch import nn, optim
@@ -213,40 +210,35 @@ def sample_stable_state_dataset(
         *metadata_x01.shape, metadata_z.fundamental_size
     )
 
-    delta_x0, delta_x1 = fundamental_stacked_delta_x(metadata_x01)
-
-    n_kx, n_ky, n_z = state_k_space.shape
-
     rng = np.random.default_rng()
-    z_indices = rng.integers(0, n_z, size=n_points)
     u = rng.uniform(0.0, 1.0, size=n_points)
     v = rng.uniform(0.0, 1.0, size=n_points)
+    z = rng.uniform(metadata_z.values[0], metadata_z.values[-1], size=n_points)
 
-    # 2. Compute physical (x, y, z) spatial positions
-    x = u * delta_x0[0] + v * delta_x1[0]
-    y = u * delta_x0[1] + v * delta_x1[1]
-    z = metadata_z.values[z_indices]
-
-    coords_out = np.stack([x, y, z], axis=0)
-
-    # 3. Compute reciprocal lattice vectors B = 2*pi * (A^-1)^T
-    dk_stacked = 2 * np.pi * np.linalg.inv(np.column_stack([delta_x0, delta_x1])).T
+    coords_out = np.stack(
+        [
+            np.cos(2 * np.pi * u),
+            np.sin(2 * np.pi * u),
+            np.cos(2 * np.pi * v),
+            np.sin(2 * np.pi * v),
+            z,
+        ],
+        axis=0,
+    )
 
     # 4. Construct wavevector grid (kx, ky) in reciprocal space
+    n_kx, n_ky = metadata_x01.shape
     m_freq = np.fft.fftfreq(n_kx) * n_kx
     n_freq = np.fft.fftfreq(n_ky) * n_ky
+    k_dot_x = (2 * np.pi) * (
+        m_freq[:, None, None] * u[None, None, :]
+        + n_freq[None, :, None] * v[None, None, :]
+    )
 
-    kx = m_freq[:, None] * dk_stacked[0, 0] + n_freq[None, :] * dk_stacked[0, 1]
-    ky = m_freq[:, None] * dk_stacked[1, 0] + n_freq[None, :] * dk_stacked[1, 1]
+    # 6. Spline-interpolate state along z-axis for continuous z coordinates
+    spline = CubicSpline(metadata_z.values, state_k_space, axis=2)
 
-    # 5. Calculate (k dot x) explicitly via broadcasting: shape (n_kx, n_ky, n_samples)
-    k_dot_x = kx[:, :, None] * x[None, None, :] + ky[:, :, None] * y[None, None, :]
-
-    # 6. Index corresponding state slice for each sample and evaluate sum over k-space: shape (n_samples,)
-    state_k_samples = state_k_space[:, :, z_indices]
-    state_out = np.sum(state_k_samples * np.exp(1j * k_dot_x), axis=(0, 1))
-
-    return state_out, coords_out
+    return np.sum(spline(z) * np.exp(1j * k_dot_x), axis=(0, 1)), coords_out
 
 
 def generate_sampled_dataset_hdf5(
@@ -265,7 +257,7 @@ def generate_sampled_dataset_hdf5(
     with h5py.File(out_path, "w") as out_f, h5py.File(in_path, "r") as original_f:
         n_states = original_f["X"].shape[0]
         x_ds = out_f.create_dataset(
-            "X", shape=(n_points, n_points, 4), dtype=np.float64
+            "X", shape=(n_points, n_points, 6), dtype=np.float64
         )
         y_ds = out_f.create_dataset(
             "Y", shape=(n_points, n_points, 2), dtype=np.float32
@@ -471,9 +463,6 @@ class PolarSIREN(nn.Module):
         return torch.cat([real, imag], dim=-1)
 
 
-# TODO: check: do we have (x,y,z, *params)
-# TODO: check: generalize to include cross channels and to take
-# delta_x as an __init__ argument
 class PeriodicComplexNN(nn.Module):
     def __init__(
         self,
@@ -483,21 +472,9 @@ class PeriodicComplexNN(nn.Module):
     ) -> None:
         super().__init__()
 
-        metadata_xy, _ = split_scattering_metadata(
-            condition_from_params(np.array([1.0])).metadata
-        )
-
-        kx_points, ky_points = fundamental_stacked_k_points(metadata_xy)
-        self.register_buffer("kx", torch.from_numpy(kx_points).to(torch.float32))
-        self.register_buffer("ky", torch.from_numpy(ky_points).to(torch.float32))
-
-        num_wavevectors = len(kx_points)
-        spatial_dim = 2 * num_wavevectors  # sin and cos features for each wavevector
-        mlp_input_dim = spatial_dim + (param_dim - 2)
-
         # 4. MLP backbone
         layers: list[nn.Module] = []
-        layers.extend((nn.Linear(mlp_input_dim, hidden_dim), nn.GELU()))
+        layers.extend((nn.Linear(param_dim, hidden_dim), nn.GELU()))
 
         for _ in range(num_layers - 1):
             layers.extend((nn.Linear(hidden_dim, hidden_dim), nn.GELU()))
@@ -506,20 +483,8 @@ class PeriodicComplexNN(nn.Module):
         self.mlp = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Input x shape: (..., param_dim)
-        # x[..., 0:1] -> x, x[..., 1:2] -> y, x[..., 2:] -> remaining features (z, E, etc.)
-        pos_x = x[..., 0:1]
-        pos_y = x[..., 1:2]
-        rest = x[..., 2:]
 
-        # Evaluate wavevector inner products: (kx * x + ky * y)
-        angles = pos_x * self.kx + pos_y * self.ky
-        spatial_features = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
-
-        # Concatenate 2D spatial Fourier features with non-periodic inputs
-        features = torch.cat([spatial_features, rest], dim=-1)
-
-        return self.mlp(features)
+        return self.mlp(x)
 
 
 def get_predicted_stable_state(
@@ -529,29 +494,32 @@ def get_predicted_stable_state(
 ) -> np.ndarray[tuple[int, int, int], np.dtype[np.complex128]]:
     """Predict the stable state from the given parameters using the trained model."""
     condition = condition_from_params(params)
-    metadata_x01, metadata_z = split_scattering_metadata(condition.metadata)
-
-    delta_x0, delta_x1 = fundamental_stacked_delta_x(metadata_x01)
-    z_points = metadata_z.values
-
-    N_kx, N_ky = grid_shape
-    N_z = len(z_points)
+    _, metadata_z = split_scattering_metadata(condition.metadata)
 
     # 1. Generate an evenly spaced grid of fractional unit-cell coordinates [0, 1)
-    u = np.linspace(0.0, 1.0, N_kx, endpoint=False)
-    v = np.linspace(0.0, 1.0, N_ky, endpoint=False)
-    u_2d, v_2d = np.meshgrid(u, v, indexing="ij")
+    u = np.linspace(0.0, 1.0, grid_shape[0], endpoint=False)
+    v = np.linspace(0.0, 1.0, grid_shape[1], endpoint=False)
 
-    # 2. Map fractional coordinates to physical (x, y, z) positions
-    x_grid = u_2d[..., None] * delta_x0[0] + v_2d[..., None] * delta_x1[0]
-    y_grid = u_2d[..., None] * delta_x0[1] + v_2d[..., None] * delta_x1[1]
-    z_grid = z_points[None, None, :]
-
-    x_3d, y_3d, z_3d = np.broadcast_arrays(x_grid, y_grid, z_grid)
+    cos_u_3d, sin_u_3d, cos_v_3d, sin_v_3d, z_3d = np.broadcast_arrays(
+        np.cos(2 * np.pi * u),
+        np.sin(2 * np.pi * u),
+        np.cos(2 * np.pi * v),
+        np.sin(2 * np.pi * v),
+        metadata_z.values[None, None, None, None, :],
+    )
 
     # 3. Combine coordinates and energy_factor into model input array (N_total, 4)
-    energy_grid = np.full_like(x_3d, params[0])
-    inputs_flat = np.stack([x_3d, y_3d, z_3d, energy_grid], axis=-1).reshape(-1, 4)
+    inputs_flat = np.stack(
+        [
+            cos_u_3d,
+            sin_u_3d,
+            cos_v_3d,
+            sin_v_3d,
+            z_3d,
+            np.full_like(cos_u_3d, params[0]),
+        ],
+        axis=-1,
+    ).reshape(-1, 6)
 
     # 4. Predict real and imaginary parts using the neural network
     device = next(model.parameters()).device
@@ -561,7 +529,7 @@ def get_predicted_stable_state(
         x_tensor = torch.from_numpy(inputs_flat).to(dtype=torch.float32, device=device)
         predictions = model(x_tensor).cpu().numpy()
 
-    state = (predictions[:, 0] + 1j * predictions[:, 1]).reshape(N_kx, N_ky, N_z)
+    state = (predictions[:, 0] + 1j * predictions[:, 1]).reshape(*grid_shape, -1)
     return np.fft.fft2(state, axes=(0, 1), norm="forward")
 
 
@@ -753,12 +721,12 @@ if __name__ == "__main__":
         #     base_path=Path("data/processed_state"),
         #     model=PolarSIREN(param_dim=4, omega_0=1.0, hidden_dim=256, num_layers=6),
         # ),
-        ScatteringLitModule(
-            name="PeriodicComplexNN",
-            train=True,
+        ScatteringLitModule.load_or_initialize_model(
+            name="PeriodicComplex",
+            train=False,
             base_path=Path("data/processed_state"),
             model=PeriodicComplexNN(
-                param_dim=4,
+                param_dim=6,
                 hidden_dim=256,
                 num_layers=6,
             ),
