@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 import h5py  # type: ignore[import-untyped]
 import numpy as np
@@ -336,16 +336,16 @@ class HDF5ScatteringDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
 
 def generate_dataset() -> None:
-    for i in range(15):
+    for i in range(50):
         data_path = Path(f"data/processed_state/stable_state_data_{i}.hdf5")
         generate_stable_state_dataset_hdf5(data_path, n_samples=500)
 
 
 def generate_specular_dataset() -> None:
-    for i in range(15):
+    for i in range(50):
         in_path = Path(f"data/processed_state/stable_state_data_{i}.hdf5")
         out_path = Path(f"data/processed_state/state_data_{i}.specular.hdf5")
-        print(f"Generating specular dataset {i + 1}/15")
+        print(f"Generating specular dataset {i + 1}/50")
         generate_specular_dataset_hdf5(in_path, out_path)
 
 
@@ -362,28 +362,74 @@ def load_datasets() -> ConcatDataset[tuple[torch.Tensor, torch.Tensor]]:
     return ConcatDataset[tuple[torch.Tensor, torch.Tensor]](datasets)
 
 
-class PeriodicComplexNN(nn.Module):
+class ResBlock(nn.Module):
+    """Pre-LayerNorm Residual Block optimized for smooth continuous field regression."""
+
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Clean residual identity highway: x + f(x)
+        return x + self.net(x)
+
+
+class ComplexNN(nn.Module):
     def __init__(
         self,
         param_dim: int,
         hidden_dim: int = 128,
-        num_layers: int = 4,
+        num_blocks: int = 5,
     ) -> None:
         super().__init__()
 
-        # 4. MLP backbone
-        layers: list[nn.Module] = []
-        layers.extend((nn.Linear(param_dim, hidden_dim), nn.GELU()))
+        self.embedding = nn.Sequential(
+            nn.Linear(param_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
 
-        for _ in range(num_layers - 1):
-            layers.extend((nn.Linear(hidden_dim, hidden_dim), nn.GELU()))
+        self.res_blocks = nn.Sequential(
+            *[ResBlock(hidden_dim) for _ in range(num_blocks)]
+        )
 
-        layers.append(nn.Linear(hidden_dim, 2))  # Predicts: [Real, Imag]
-        self.mlp = nn.Sequential(*layers)
+        self.head = nn.Linear(hidden_dim, 2)
 
+        self.init_weights()
+
+    def init_weights(self) -> None:
+        # 1. Uniform for hidden linear layers with GELU/ReLU
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(
+                    m.weight, a=0, mode="fan_in", nonlinearity="relu"
+                )
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # 2. Scale down or zero-init the final layer in each ResBlock
+        for block in self.res_blocks:
+            # Assuming ResBlock has linear layers; target the final projection layer
+            if hasattr(block, "net") and isinstance(block.net[-1], nn.Linear):  # ty: ignore[not-subscriptable]
+                nn.init.zeros_(block.net[-1].weight)  # ty: ignore[not-subscriptable]
+
+        # 3. Small initialization for output head to prevent initial loss spikes
+        nn.init.normal_(self.head.weight, std=1e-3)
+        if self.head.bias is not None:
+            nn.init.zeros_(self.head.bias)
+
+    @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-
-        return self.mlp(x)
+        x = self.embedding(x)
+        x = self.res_blocks(x)
+        return self.head(x)
 
 
 def get_predicted_stable_state(
@@ -443,11 +489,12 @@ class ScatteringLitModule(pl.LightningModule):
     ) -> None:
         super().__init__()
         self.model = model
-        self.criterion = nn.MSELoss()
         self.name = name
         self.should_train = train
         self.base_path = base_path
         self.save_hyperparameters(ignore=["model"])
+
+        self.criterion = nn.MSELoss()
 
     @property
     def checkpoint_path(self) -> Path:
@@ -545,12 +592,13 @@ def train_model(
         log_every_n_steps=10,
     )
 
-    ckpt_path = model_entry.checkpoint_path
     trainer.fit(
         model_entry,
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
-        ckpt_path=ckpt_path if ckpt_path.exists() else None,
+        ckpt_path=model_entry.checkpoint_path
+        if model_entry.checkpoint_path.exists()
+        else None,
     )
 
 
@@ -569,14 +617,15 @@ def get_flat_condition(condition: MorseScatteringCondition) -> MorseScatteringCo
     )
 
 
-def plot_specular_predictions(
+def plot_channel_predictions(
     model_zoo: list[ScatteringLitModule],
     *,
     ax: plt.Axes | None = None,
     channel: tuple[int, int] = (0, 0),
 ) -> tuple[plt.Figure, plt.Axes]:
     """Plot actual and predicted specular prediction for every model."""
-    test_params = np.array([1.0])
+    rng = np.random.default_rng()
+    test_params = rng.uniform(size=1)
     condition = condition_from_params(params=test_params)
 
     config = OptimizationConfig(precision=1e-5, max_iterations=1000, n_channels=160)
@@ -610,25 +659,21 @@ def plot_specular_predictions(
 
 
 if __name__ == "__main__":
-    # generate_dataset()
-    # generate_specular_dataset()
+    generate_dataset()
+    generate_specular_dataset()
     sample_dataset()
 
     model_zoo: list[ScatteringLitModule] = [
         ScatteringLitModule(
-            name="PeriodicComplex",
+            name="ComplexNN",
             train=False,
             base_path=Path("data/processed_state"),
-            model=PeriodicComplexNN(
-                param_dim=6,
-                hidden_dim=256,
-                num_layers=6,
-            ),
+            model=ComplexNN(param_dim=6, hidden_dim=256, num_blocks=6),
         ),
     ]
     for m in model_zoo:
         if m.should_train:
             train_model(m, epochs=1000)
 
-    fig, ax = plot_specular_predictions(model_zoo, channel=(0, 0))
+    fig, ax = plot_channel_predictions(model_zoo, channel=(0, 0))
     fig.savefig("data/processed_state/specular_predictions.pdf")
