@@ -76,17 +76,13 @@ def get_stable_state(
         converted_condition.incident_k,
     )
 
-    # Get the scattering state
     state = get_scattering_state(condition, config)
-
-    # Get the preconditioned state
     preconditioned_state = get_preconditioned_state_from_state(
         state,
         condition,
         n_channels=config.n_channels,
     )
 
-    # Return the real and imaginary parts of the preconditioned state
     preconditioned_data = preconditioned_state.with_basis(
         close_coupling_basis(condition.metadata),
     ).raw_data.reshape(condition.metadata.shape)
@@ -140,7 +136,6 @@ def params_from_condition(
 ) -> np.ndarray[tuple[int], np.dtype[np.float64]]:
     """Extract the parameters from a ScatteringCondition."""
     condition = condition.with_units(UnitSystem())
-
     energy = condition.incident_energy / HELIUM_ENERGY
     return normalize_params(np.array([energy]))
 
@@ -154,22 +149,16 @@ def generate_stable_state_dataset_hdf5(
         print(f"Dataset already exists at {filepath}. Skipping generation.")
         return
 
-    print(
-        f"Generating {n_samples} samples straight to disk. This may take a while...",
-    )
+    print(f"Generating {n_samples} samples straight to disk. This may take a while...")
     rng = np.random.default_rng()
 
     with h5py.File(filepath, "w") as f:
-        # Inputs (energy_factor,) for each sampled condition and coordinate
         x_ds = f.create_dataset("X", shape=(n_samples, 1), dtype=np.float64)
-
-        # Outputs (real, imag) of the sampled state at each coordinate
         n_points = np.prod(shape)
         y_ds = f.create_dataset("Y", shape=(n_samples, n_points, 2), dtype=np.float64)
 
         for i in range(n_samples):
             print(f"Generating sample {i + 1}/{n_samples}")
-
             params = rng.uniform(size=1)
             condition = condition_from_params(params)
             config = OptimizationConfig(
@@ -190,7 +179,13 @@ def sample_stable_state_dataset(
 ) -> tuple[
     np.ndarray[tuple[int], np.dtype[np.complex128]],
     np.ndarray[tuple[int, int], np.dtype[np.floating]],
+    tuple[
+        np.ndarray[tuple[int], np.dtype[np.complex128]],
+        np.ndarray[tuple[int], np.dtype[np.complex128]],
+        np.ndarray[tuple[int], np.dtype[np.complex128]],
+    ],
 ]:
+    """Sample state value and analytical spatial partial derivatives (dx, dy, dz)."""
     condition = condition_from_params(params)
     metadata_x01, metadata_z = split_scattering_metadata(condition.metadata)
 
@@ -214,25 +209,45 @@ def sample_stable_state_dataset(
         axis=0,
     )
 
-    # 4. Construct wavevector grid (kx, ky) in reciprocal space
+    # Construct wavevector grid in reciprocal space
     n_kx, n_ky = metadata_x01.shape
     m_freq = np.fft.fftfreq(n_kx) * n_kx
     n_freq = np.fft.fftfreq(n_ky) * n_ky
-    k_dot_x = (2 * np.pi) * (
+
+    # Calculate exponent phases and cubic spline
+    phase = (2 * np.pi) * (
         m_freq[:, None, None] * u[None, None, :]
         + n_freq[None, :, None] * v[None, None, :]
     )
+    exp_phase = np.exp(1j * phase)
 
-    # 6. Spline-interpolate state along z-axis for continuous z coordinates
     spline = CubicSpline(metadata_z.values, state_k_space, axis=2)
+    spline_z = spline(z)
+    spline_dz = spline.derivative(1)(z)
 
-    return np.sum(spline(z) * np.exp(1j * k_dot_x), axis=(0, 1)), coords_out
+    # 1. Base wavefunction psi(x, y, z)
+    psi = np.sum(spline_z * exp_phase, axis=(0, 1))
+
+    # 2. Derivative d psi / du (x-direction)
+    d_psi_du = np.sum(
+        (1j * 2 * np.pi * m_freq[:, None, None]) * spline_z * exp_phase, axis=(0, 1)
+    )
+
+    # 3. Derivative d psi / dv (y-direction)
+    d_psi_dv = np.sum(
+        (1j * 2 * np.pi * n_freq[None, :, None]) * spline_z * exp_phase, axis=(0, 1)
+    )
+
+    # 4. Derivative d psi / dz (z-direction)
+    d_psi_dz = np.sum(spline_dz * exp_phase, axis=(0, 1))
+
+    return psi, coords_out, (d_psi_du, d_psi_dv, d_psi_dz)
 
 
 def generate_sampled_dataset_hdf5(
     in_path: Path, out_path: Path, n_points: int = 100 * 100
 ) -> None:
-    """Generate parameters and Preconditioned state, saving them directly to disk."""
+    """Generate parameters, state values, and derivatives saving directly to disk."""
     if not in_path.exists():
         print(f"Dataset doesn't exist at {in_path}. Skipping generation.")
         return
@@ -248,7 +263,7 @@ def generate_sampled_dataset_hdf5(
             "X", shape=(n_states, n_points, 6), dtype=np.float64
         )
         y_ds = out_f.create_dataset(
-            "Y", shape=(n_states, n_points, 2), dtype=np.float32
+            "Y", shape=(n_states, n_points, 8), dtype=np.float32
         )
 
         for i in range(original_f["X"].shape[0]):
@@ -257,13 +272,24 @@ def generate_sampled_dataset_hdf5(
             params = original_f["X"][i]
             full_state = original_f["Y"][i, :, 0] + 1j * original_f["Y"][i, :, 1]
 
-            state, coordinates = sample_stable_state_dataset(
-                params, full_state, n_points=n_points
+            state, coordinates, (d_psi_du, d_psi_dv, d_psi_dz) = (
+                sample_stable_state_dataset(params, full_state, n_points=n_points)
             )
 
             energies = np.full((n_points, 1), params[0])
             x_ds[i] = np.hstack([coordinates.T, energies])
-            y_ds[i] = np.column_stack([state.real, state.imag]).astype(np.float32)
+            y_ds[i] = np.column_stack(
+                [
+                    state.real,
+                    state.imag,
+                    d_psi_du.real,
+                    d_psi_du.imag,
+                    d_psi_dv.real,
+                    d_psi_dv.imag,
+                    d_psi_dz.real,
+                    d_psi_dz.imag,
+                ]
+            ).astype(np.float32)
 
 
 def generate_specular_dataset_hdf5(in_path: Path, out_path: Path) -> None:
@@ -308,7 +334,6 @@ class HDF5ScatteringDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         self.filepath = filepath
         self._file = None
 
-        # Inspect length during initialization
         with h5py.File(self.filepath, "r") as f:
             self._length = len(f["X"])
 
@@ -316,14 +341,12 @@ class HDF5ScatteringDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         return self._length
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:  # ty: ignore[invalid-method-override]
-        # Lazy file loading avoids HDF5 file-handle serialization issues with DataLoader workers
         if self._file is None:
             self._file = h5py.File(self.filepath, "r")
 
         x_arr = self._file["X"][idx]
         y_arr = self._file["Y"][idx]
 
-        # Convert to float32 tensors for PyTorch model compatibility
         x_tensor = torch.from_numpy(x_arr).to(torch.float32)
         y_tensor = torch.from_numpy(y_arr).to(torch.float32)
 
@@ -376,7 +399,6 @@ class ResBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Clean residual identity highway: x + f(x)
         return x + self.net(x)
 
 
@@ -400,11 +422,9 @@ class ComplexNN(nn.Module):
         )
 
         self.head = nn.Linear(hidden_dim, 2)
-
         self.init_weights()
 
     def init_weights(self) -> None:
-        # 1. Uniform for hidden linear layers with GELU/ReLU
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_uniform_(
@@ -413,72 +433,73 @@ class ComplexNN(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-        # 2. Scale down or zero-init the final layer in each ResBlock
         for block in self.res_blocks:
-            # Assuming ResBlock has linear layers; target the final projection layer
             if hasattr(block, "net") and isinstance(block.net[-1], nn.Linear):  # ty: ignore[not-subscriptable]
                 nn.init.zeros_(block.net[-1].weight)  # ty: ignore[not-subscriptable]
 
-        # 3. Small initialization for output head to prevent initial loss spikes
         nn.init.normal_(self.head.weight, std=1e-2)
         if self.head.bias is not None:
             nn.init.zeros_(self.head.bias)
 
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO: this is a hack to make z in the +-1 range
-        x = x.clone()
-        x[..., 4] = (x[..., 4] / 4) - 1.0
 
         x = self.embedding(x)
         x = self.res_blocks(x)
         return self.head(x)
 
 
-def get_predicted_stable_state(
-    model: nn.Module,
-    params: np.ndarray[tuple[int], np.dtype[np.float64]],
-    grid_shape: tuple[int, int] = (80, 80),
-) -> np.ndarray[tuple[int, int, int], np.dtype[np.complex128]]:
-    """Predict the stable state from the given parameters using the trained model."""
-    condition = condition_from_params(params)
-    _, metadata_z = split_scattering_metadata(condition.metadata)
+class DerivativeLoss(nn.Module):
+    """Derivative Loss calculated from spatial derivatives."""
 
-    # 1. Generate an evenly spaced grid of fractional unit-cell coordinates [0, 1)
-    u = np.linspace(0.0, 1.0, grid_shape[0], endpoint=False)
-    v = np.linspace(0.0, 1.0, grid_shape[1], endpoint=False)
+    def __init__(self) -> None:
+        super().__init__()
+        self.mse = nn.MSELoss()
 
-    cos_u_3d, sin_u_3d, cos_v_3d, sin_v_3d, z_3d = np.broadcast_arrays(
-        np.cos(2 * np.pi * u[:, None, None]),
-        np.sin(2 * np.pi * u[:, None, None]),
-        np.cos(2 * np.pi * v[None, :, None]),
-        np.sin(2 * np.pi * v[None, :, None]),
-        metadata_z.values[None, None, :],
-    )
+    def forward(
+        self, x: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor
+    ) -> torch.Tensor:
 
-    # 3. Combine coordinates and energy_factor into model input array (N_total, 4)
-    inputs_flat = np.stack(
-        [
-            cos_u_3d,
-            sin_u_3d,
-            cos_v_3d,
-            sin_v_3d,
-            z_3d,
-            np.full_like(cos_u_3d, params[0]),
-        ],
-        axis=-1,
-    ).reshape(-1, 6)
+        # 2. Compute gradients of predicted real and imag components w.r.t input x
+        grad_real = torch.autograd.grad(
+            outputs=y_pred[..., 0].sum(),
+            inputs=x,
+            create_graph=self.training,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
 
-    # 4. Predict real and imaginary parts using the neural network
-    device = next(model.parameters()).device
-    model.eval()
+        grad_imag = torch.autograd.grad(
+            outputs=y_pred[..., 1].sum(),
+            inputs=x,
+            create_graph=self.training,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
 
-    with torch.no_grad():
-        x_tensor = torch.from_numpy(inputs_flat).to(dtype=torch.float32, device=device)
-        predictions = model(x_tensor).cpu().numpy()
+        # 3. Apply chain rule to reconstruct d/du, d/dv, d/dz
+        # x0 = cos(2pi u), x1 = sin(2pi u) -> d/du = 2pi * (-x1 * d/dx0 + x0 * d/dx1)
+        d_pred_du_r = -x[..., 1] * grad_real[..., 0] + x[..., 0] * grad_real[..., 1]
+        d_pred_du_i = -x[..., 1] * grad_imag[..., 0] + x[..., 0] * grad_imag[..., 1]
 
-    state = (predictions[:, 0] + 1j * predictions[:, 1]).reshape(*grid_shape, -1)
-    return np.fft.fft2(state, axes=(0, 1), norm="forward")
+        # x2 = cos(2pi v), x3 = sin(2pi v) -> d/dv = 2pi * (-x3 * d/dx2 + x2 * d/dx3)
+        d_pred_dv_r = -x[..., 3] * grad_real[..., 2] + x[..., 2] * grad_real[..., 3]
+        d_pred_dv_i = -x[..., 3] * grad_imag[..., 2] + x[..., 2] * grad_imag[..., 3]
+
+        pred_derivatives = torch.stack(
+            [
+                2 * np.pi * d_pred_du_r,
+                2 * np.pi * d_pred_du_i,
+                2 * np.pi * d_pred_dv_r,
+                2 * np.pi * d_pred_dv_i,
+                # x4 = z -> d/dz = d/dx4
+                grad_real[..., 4],
+                grad_imag[..., 4],
+            ],
+            dim=-1,
+        )
+
+        return self.mse(pred_derivatives, y_true[..., 2:8])
 
 
 class ScatteringLitModule(pl.LightningModule):
@@ -497,7 +518,17 @@ class ScatteringLitModule(pl.LightningModule):
         self.base_path = base_path
         self.save_hyperparameters(ignore=["model"])
 
-        self.criterion = nn.MSELoss()
+        self.derivative_criterion = DerivativeLoss()
+        self.mse_criterion = nn.MSELoss()
+
+    @property
+    def derivative_weight(self) -> float:
+        """Linear ramp-up of relative derivative loss weight."""
+        ramp_epochs = 150
+        max_weight = 0.05
+        if self.current_epoch >= ramp_epochs:
+            return max_weight
+        return max_weight * (self.current_epoch / ramp_epochs)
 
     @property
     def checkpoint_path(self) -> Path:
@@ -517,7 +548,6 @@ class ScatteringLitModule(pl.LightningModule):
                 "loading best model from checkpoint",
                 base_path / name / "best_model.ckpt",
             )
-
             torch.serialization.add_safe_globals(
                 [pathlib.PosixPath, pathlib.WindowsPath]
             )
@@ -537,9 +567,34 @@ class ScatteringLitModule(pl.LightningModule):
         self, batch: tuple[torch.Tensor, torch.Tensor], _batch_idx: int
     ) -> torch.Tensor:
         x, y = batch
+        x = x.requires_grad_()
         predictions = self(x)
-        loss = self.criterion(predictions, y)
+
+        mse_loss = self.mse_criterion(predictions[..., 0:2], y[..., 0:2])
+        derivative_loss = self.derivative_criterion(x, predictions, y)
+
+        loss = mse_loss + self.derivative_weight * derivative_loss
+
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log(
+            "train_mse_loss", mse_loss, on_step=False, on_epoch=True, prog_bar=False
+        )
+        self.log(
+            "train_derivative_loss",
+            derivative_loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+        )
+
+        self.log(
+            "derivative_weight",
+            self.derivative_weight,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+        )
+
         return loss
 
     def validation_step(
@@ -547,8 +602,9 @@ class ScatteringLitModule(pl.LightningModule):
     ) -> None:
         x, y = batch
         predictions = self(x)
-        loss = self.criterion(predictions, y)
-        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        mse_loss = self.mse_criterion(predictions[..., 0:2], y[..., 0:2])
+
+        self.log("val_loss", mse_loss, on_step=False, on_epoch=True, prog_bar=True)
 
     def configure_optimizers(self) -> OptimizerLRSchedulerConfig:
         optimizer = optim.AdamW(self.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -578,10 +634,10 @@ def train_model(
     train_dataset, val_dataset = random_split(sampled_dataset, [0.8, 0.2])
 
     train_loader = DataLoader(
-        train_dataset, batch_size=32, shuffle=True, num_workers=0, pin_memory=False
+        train_dataset, batch_size=8, shuffle=True, num_workers=0, pin_memory=False
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=32, shuffle=False, num_workers=0, pin_memory=False
+        val_dataset, batch_size=8, shuffle=False, num_workers=0, pin_memory=False
     )
 
     checkpoint_callback = ModelCheckpoint(
@@ -598,7 +654,6 @@ def train_model(
         mode="min",
     )
     csv_logger = CSVLogger(save_dir=model_entry.base_path, name=model_entry.name)
-    # use with tensorboard --logdir data/
     tb_logger = TensorBoardLogger(save_dir=model_entry.base_path, name=model_entry.name)
     trainer = pl.Trainer(
         max_epochs=epochs,
@@ -635,13 +690,55 @@ def get_flat_condition(condition: MorseScatteringCondition) -> MorseScatteringCo
     )
 
 
+def get_predicted_stable_state(
+    model: nn.Module,
+    params: np.ndarray[tuple[int], np.dtype[np.float64]],
+    grid_shape: tuple[int, int] = (80, 80),
+) -> np.ndarray[tuple[int, int, int], np.dtype[np.complex128]]:
+    """Predict the stable state from the given parameters using the trained model."""
+    condition = condition_from_params(params)
+    _, metadata_z = split_scattering_metadata(condition.metadata)
+
+    u = np.linspace(0.0, 1.0, grid_shape[0], endpoint=False)
+    v = np.linspace(0.0, 1.0, grid_shape[1], endpoint=False)
+
+    cos_u_3d, sin_u_3d, cos_v_3d, sin_v_3d, z_3d = np.broadcast_arrays(
+        np.cos(2 * np.pi * u[:, None, None]),
+        np.sin(2 * np.pi * u[:, None, None]),
+        np.cos(2 * np.pi * v[None, :, None]),
+        np.sin(2 * np.pi * v[None, :, None]),
+        metadata_z.values[None, None, :],
+    )
+
+    inputs_flat = np.stack(
+        [
+            cos_u_3d,
+            sin_u_3d,
+            cos_v_3d,
+            sin_v_3d,
+            z_3d,
+            np.full_like(cos_u_3d, params[0]),
+        ],
+        axis=-1,
+    ).reshape(-1, 6)
+
+    device = next(model.parameters()).device
+    model.eval()
+
+    with torch.no_grad():
+        x_tensor = torch.from_numpy(inputs_flat).to(dtype=torch.float32, device=device)
+        predictions = model(x_tensor).cpu().numpy()
+
+    state = (predictions[:, 0] + 1j * predictions[:, 1]).reshape(*grid_shape, -1)
+    return np.fft.fft2(state, axes=(0, 1), norm="forward")
+
+
 def plot_channel_predictions(
     model_zoo: list[ScatteringLitModule],
     *,
     ax: plt.Axes | None = None,
     channel: tuple[int, int] = (0, 0),
 ) -> tuple[plt.Figure, plt.Axes]:
-    """Plot actual and predicted specular prediction for every model."""
     rng = np.random.default_rng()
     test_params = rng.uniform(size=1)
     condition = condition_from_params(params=test_params)
@@ -677,8 +774,8 @@ def plot_channel_predictions(
         line3.set_color(line1.get_color())
         line3.set_linestyle(":")
     ax.set_xlabel("z")
-    ax.set_ylabel(r"$|\psi_{00}(z)|$")
-    ax.set_title(r"Actual and predicted $\psi_{00}(z)$ for all models")
+    ax.set_ylabel(rf"$|\psi_{{{channel[0]}{channel[1]}}}(z)|$")
+    ax.set_title(rf"Actual and predicted $\psi_{{{channel[0]}{channel[1]}}}(z)$")
     ax.legend()
     ax.grid(visible=True, alpha=0.25)
 
@@ -690,7 +787,6 @@ def plot_real_space_predictions(
     *,
     ax: plt.Axes | None = None,
 ) -> tuple[plt.Figure, plt.Axes]:
-    """Plot actual and predicted specular prediction for every model."""
     rng = np.random.default_rng()
     test_params = rng.uniform(size=1)
     condition = condition_from_params(params=test_params)
@@ -741,19 +837,13 @@ def plot_energy_distribution(
     ax: plt.Axes | None = None,
     bins: int = 30,
 ) -> tuple[plt.Figure, plt.Axes]:
-    """Plot a histogram of the energy distribution across samples in the training set."""
-    dataset = load_datasets()
+    """Plot the distribution of energy factors in the training dataset."""
+    energies = []
+    for file in sorted(Path("data/processed_state").glob("state_data_*.sampled.hdf5")):
+        with h5py.File(file, "r") as f:
+            energies.append(f["X"][:, 0, -1])
+    energies = np.array(energies).ravel()
 
-    # Extract the energy parameter (column index 5) from each state sample in the dataset
-    n_samples = min(10000, len(dataset))
-
-    # Pick random indices without replacement
-    rng = np.random.default_rng()
-    indices = rng.choice(len(dataset), size=n_samples, replace=False)
-    print("pass")
-    # Extract energies for only the randomly selected indices
-    energies = np.array([dataset[int(i)][0][0, -1].item() for i in indices])
-    print("pass")
     fig, ax = get_figure(ax=ax)
     ax.hist(energies, bins=bins, edgecolor="black", alpha=0.7)
 
@@ -776,9 +866,9 @@ if __name__ == "__main__":
         fig.savefig("data/processed_state/energy_distribution.pdf")
 
     model_zoo: list[ScatteringLitModule] = [
-        ScatteringLitModule.load_or_initialize_model(
-            name="ComplexNN1",
-            should_train=False,
+        ScatteringLitModule(
+            name="ComplexNN3",
+            should_train=True,
             base_path=Path("data/processed_state"),
             model=ComplexNN(param_dim=6, hidden_dim=256, num_blocks=6),
         ),
