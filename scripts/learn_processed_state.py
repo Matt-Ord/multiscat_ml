@@ -487,13 +487,13 @@ class ScatteringLitModule(pl.LightningModule):
         *,
         model: nn.Module,
         name: str,
-        train: bool = True,
+        should_train: bool = True,
         base_path: Path = Path("data/processed_state"),
     ) -> None:
         super().__init__()
         self.model = model
         self.name = name
-        self.should_train = train
+        self.should_train = should_train
         self.base_path = base_path
         self.save_hyperparameters(ignore=["model"])
 
@@ -509,7 +509,7 @@ class ScatteringLitModule(pl.LightningModule):
         *,
         model: nn.Module,
         name: str,
-        train: bool = True,
+        should_train: bool = True,
         base_path: Path = Path("data/processed_state"),
     ) -> ScatteringLitModule:
         if (base_path / name / "best_model.ckpt").exists():
@@ -524,9 +524,11 @@ class ScatteringLitModule(pl.LightningModule):
             return cls.load_from_checkpoint(
                 checkpoint_path=base_path / name / "best_model.ckpt",
                 model=model,
-                train=train,
+                should_train=should_train,
             )
-        return cls(model=model, name=name, train=train, base_path=base_path)
+        return cls(
+            model=model, name=name, should_train=should_train, base_path=base_path
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
@@ -764,9 +766,10 @@ def plot_energy_distribution(
 
 
 if __name__ == "__main__":
-    generate_dataset()
-    generate_specular_dataset()
-    sample_dataset()
+    if False:
+        generate_dataset()
+        generate_specular_dataset()
+        sample_dataset()
 
     if False:
         fig, ax = plot_energy_distribution()
@@ -775,7 +778,7 @@ if __name__ == "__main__":
     model_zoo: list[ScatteringLitModule] = [
         ScatteringLitModule.load_or_initialize_model(
             name="ComplexNN1",
-            train=False,
+            should_train=False,
             base_path=Path("data/processed_state"),
             model=ComplexNN(param_dim=6, hidden_dim=256, num_blocks=6),
         ),
@@ -784,7 +787,7 @@ if __name__ == "__main__":
         if m.should_train:
             train_model(m, epochs=1000)
 
-    fig, ax = plot_channel_predictions(model_zoo, channel=(0, 0))
+    fig, ax = plot_channel_predictions(model_zoo, channel=(1, 0))
     fig.savefig("data/processed_state/specular_predictions.pdf")
 
     fig, ax = plot_real_space_predictions(model_zoo)
