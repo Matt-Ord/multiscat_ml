@@ -1,3 +1,4 @@
+import pathlib
 from pathlib import Path
 from typing import TYPE_CHECKING, override
 
@@ -254,9 +255,7 @@ def generate_sampled_dataset_hdf5(
             print(f"Generating sample {i + 1}/{n_states}")
 
             params = original_f["X"][i]
-            full_state_re = original_f["Y"][i, :, 0]
-            full_state_im = original_f["Y"][i, :, 1]
-            full_state = full_state_re + 1j * full_state_im
+            full_state = original_f["Y"][i, :, 0] + 1j * original_f["Y"][i, :, 1]
 
             state, coordinates = sample_stable_state_dataset(
                 params, full_state, n_points=n_points
@@ -345,7 +344,7 @@ def generate_specular_dataset() -> None:
     for i in range(50):
         in_path = Path(f"data/processed_state/stable_state_data_{i}.hdf5")
         out_path = Path(f"data/processed_state/state_data_{i}.specular.hdf5")
-        print(f"Generating specular dataset {i + 1}/50")
+        print(f"Generating specular dataset {i + 1}")
         generate_specular_dataset_hdf5(in_path, out_path)
 
 
@@ -421,12 +420,16 @@ class ComplexNN(nn.Module):
                 nn.init.zeros_(block.net[-1].weight)  # ty: ignore[not-subscriptable]
 
         # 3. Small initialization for output head to prevent initial loss spikes
-        nn.init.normal_(self.head.weight, std=1e-3)
+        nn.init.normal_(self.head.weight, std=1e-2)
         if self.head.bias is not None:
             nn.init.zeros_(self.head.bias)
 
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # TODO: this is a hack to make z in the +-1 range
+        x = x.clone()
+        x[..., 4] = (x[..., 4] / 4) - 1.0
+
         x = self.embedding(x)
         x = self.res_blocks(x)
         return self.head(x)
@@ -510,8 +513,18 @@ class ScatteringLitModule(pl.LightningModule):
         base_path: Path = Path("data/processed_state"),
     ) -> ScatteringLitModule:
         if (base_path / name / "best_model.ckpt").exists():
+            print(
+                "loading best model from checkpoint",
+                base_path / name / "best_model.ckpt",
+            )
+
+            torch.serialization.add_safe_globals(
+                [pathlib.PosixPath, pathlib.WindowsPath]
+            )
             return cls.load_from_checkpoint(
                 checkpoint_path=base_path / name / "best_model.ckpt",
+                model=model,
+                train=train,
             )
         return cls(model=model, name=name, train=train, base_path=base_path)
 
@@ -536,7 +549,7 @@ class ScatteringLitModule(pl.LightningModule):
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
 
     def configure_optimizers(self) -> OptimizerLRSchedulerConfig:
-        optimizer = optim.AdamW(self.parameters(), lr=1e-3, weight_decay=1e-3)
+        optimizer = optim.AdamW(self.parameters(), lr=1e-3, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=5
         )
@@ -553,11 +566,14 @@ def train_model(
     model_entry: ScatteringLitModule,
     epochs: int = 200,
     max_epochs_without_improvement: int = 200,
+    data_fraction: float = 0.1,
 ) -> None:
     model_entry.base_path.mkdir(parents=True, exist_ok=True)
 
-    full_dataset = load_datasets()
-    train_dataset, val_dataset, _ = random_split(full_dataset, [0.2, 0.05, 0.75])
+    sampled_dataset, _ = random_split(
+        load_datasets(), [data_fraction, 1.0 - data_fraction]
+    )
+    train_dataset, val_dataset = random_split(sampled_dataset, [0.8, 0.2])
 
     train_loader = DataLoader(
         train_dataset, batch_size=32, shuffle=True, num_workers=0, pin_memory=False
@@ -638,16 +654,76 @@ def plot_channel_predictions(
     fig, ax = get_figure(ax=ax)
     z_points = split_scattering_metadata(condition.metadata)[1].values
     actual_psi_00 = actual[*channel, :]
-    ax.plot(z_points, np.real(actual_psi_00))
-    ax.plot(z_points, np.imag(actual_psi_00))
-    ax.plot(z_points, np.abs(actual_psi_00))
+    (line1,) = ax.plot(z_points, np.real(actual_psi_00))
+    (line2,) = ax.plot(z_points, np.imag(actual_psi_00))
+    line2.set_color(line1.get_color())
+    line2.set_linestyle("--")
+    (line3,) = ax.plot(z_points, np.abs(actual_psi_00))
+    line3.set_color(line1.get_color())
+    line3.set_linestyle(":")
 
     for entry in model_zoo:
         predicted = get_predicted_stable_state(
             model=entry.model,
             params=test_params,
         )
-        ax.plot(z_points, np.abs(predicted[*channel, :]), label=entry.name)
+        (line1,) = ax.plot(z_points, np.real(predicted[*channel, :]), label=entry.name)
+        (line2,) = ax.plot(z_points, np.imag(predicted[*channel, :]))
+        line2.set_color(line1.get_color())
+        line2.set_linestyle("--")
+        (line3,) = ax.plot(z_points, np.abs(predicted[*channel, :]))
+        line3.set_color(line1.get_color())
+        line3.set_linestyle(":")
+    ax.set_xlabel("z")
+    ax.set_ylabel(r"$|\psi_{00}(z)|$")
+    ax.set_title(r"Actual and predicted $\psi_{00}(z)$ for all models")
+    ax.legend()
+    ax.grid(visible=True, alpha=0.25)
+
+    return fig, ax
+
+
+def plot_real_space_predictions(
+    model_zoo: list[ScatteringLitModule],
+    *,
+    ax: plt.Axes | None = None,
+) -> tuple[plt.Figure, plt.Axes]:
+    """Plot actual and predicted specular prediction for every model."""
+    rng = np.random.default_rng()
+    test_params = rng.uniform(size=1)
+    condition = condition_from_params(params=test_params)
+
+    config = OptimizationConfig(precision=1e-5, max_iterations=1000, n_channels=160)
+    actual = get_stable_state(condition, config=config)
+
+    specular_condition = get_flat_condition(condition)
+    specular_state = get_stable_state(specular_condition, config=config)
+    actual -= specular_state
+
+    fig, ax = get_figure(ax=ax)
+    z_points = split_scattering_metadata(condition.metadata)[1].values
+    data_at_origin = np.fft.ifft2(actual, axes=(0, 1), norm="forward")[0, 0]
+    (line1,) = ax.plot(z_points, np.real(data_at_origin))
+    (line2,) = ax.plot(z_points, np.imag(data_at_origin))
+    line2.set_color(line1.get_color())
+    line2.set_linestyle("--")
+    (line3,) = ax.plot(z_points, np.abs(data_at_origin))
+    line3.set_color(line1.get_color())
+    line3.set_linestyle(":")
+
+    for entry in model_zoo:
+        predicted = get_predicted_stable_state(
+            model=entry.model,
+            params=test_params,
+        )
+        data_at_origin = np.fft.ifft2(predicted, axes=(0, 1), norm="forward")[0, 0]
+        (line1,) = ax.plot(z_points, np.real(data_at_origin), label=entry.name)
+        (line2,) = ax.plot(z_points, np.imag(data_at_origin))
+        line2.set_color(line1.get_color())
+        line2.set_linestyle("--")
+        (line3,) = ax.plot(z_points, np.abs(data_at_origin))
+        line3.set_color(line1.get_color())
+        line3.set_linestyle(":")
 
     ax.set_xlabel("z")
     ax.set_ylabel(r"$|\psi_{00}(z)|$")
@@ -658,14 +734,47 @@ def plot_channel_predictions(
     return fig, ax
 
 
+def plot_energy_distribution(
+    *,
+    ax: plt.Axes | None = None,
+    bins: int = 30,
+) -> tuple[plt.Figure, plt.Axes]:
+    """Plot a histogram of the energy distribution across samples in the training set."""
+    dataset = load_datasets()
+
+    # Extract the energy parameter (column index 5) from each state sample in the dataset
+    n_samples = min(10000, len(dataset))
+
+    # Pick random indices without replacement
+    rng = np.random.default_rng()
+    indices = rng.choice(len(dataset), size=n_samples, replace=False)
+    print("pass")
+    # Extract energies for only the randomly selected indices
+    energies = np.array([dataset[int(i)][0][0, -1].item() for i in indices])
+    print("pass")
+    fig, ax = get_figure(ax=ax)
+    ax.hist(energies, bins=bins, edgecolor="black", alpha=0.7)
+
+    ax.set_xlabel("Energy Factor")
+    ax.set_ylabel("Sample Count")
+    ax.set_title("Training Set Energy Distribution")
+    ax.grid(visible=True, alpha=0.25)
+
+    return fig, ax
+
+
 if __name__ == "__main__":
     generate_dataset()
     generate_specular_dataset()
     sample_dataset()
 
+    if False:
+        fig, ax = plot_energy_distribution()
+        fig.savefig("data/processed_state/energy_distribution.pdf")
+
     model_zoo: list[ScatteringLitModule] = [
-        ScatteringLitModule(
-            name="ComplexNN",
+        ScatteringLitModule.load_or_initialize_model(
+            name="ComplexNN1",
             train=False,
             base_path=Path("data/processed_state"),
             model=ComplexNN(param_dim=6, hidden_dim=256, num_blocks=6),
@@ -677,3 +786,6 @@ if __name__ == "__main__":
 
     fig, ax = plot_channel_predictions(model_zoo, channel=(0, 0))
     fig.savefig("data/processed_state/specular_predictions.pdf")
+
+    fig, ax = plot_real_space_predictions(model_zoo)
+    fig.savefig("data/processed_state/real_space_predictions.pdf")
