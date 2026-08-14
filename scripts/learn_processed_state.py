@@ -140,6 +140,22 @@ def params_from_condition(
     return normalize_params(np.array([energy]))
 
 
+def get_flat_condition(condition: MorseScatteringCondition) -> MorseScatteringCondition:
+    """Get a ScatteringCondition with zero corrugation (beta=0)."""
+    return MorseScatteringCondition(
+        mass=condition.mass,
+        incident_k=condition.incident_k,
+        morse_parameters=operator.build.CorrugatedMorseParameters(
+            depth=condition.morse_parameters.depth,
+            height=condition.morse_parameters.height,
+            offset=condition.morse_parameters.offset,
+            beta=0,
+        ),
+        metadata=condition.metadata,
+        units=condition.units,
+    )
+
+
 def generate_stable_state_dataset_hdf5(
     filepath: Path, shape: tuple[int, int, int] = (18, 18, 200), n_samples: int = 500
 ) -> None:
@@ -443,7 +459,6 @@ class ComplexNN(nn.Module):
 
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-
         x = self.embedding(x)
         x = self.res_blocks(x)
         return self.head(x)
@@ -459,7 +474,6 @@ class DerivativeLoss(nn.Module):
     def forward(
         self, x: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor
     ) -> torch.Tensor:
-
         # 2. Compute gradients of predicted real and imag components w.r.t input x
         grad_real = torch.autograd.grad(
             outputs=y_pred[..., 0].sum(),
@@ -524,11 +538,16 @@ class ScatteringLitModule(pl.LightningModule):
     @property
     def derivative_weight(self) -> float:
         """Linear ramp-up of relative derivative loss weight."""
+        skip_epochs = 50
         ramp_epochs = 150
-        max_weight = 0.05
-        if self.current_epoch >= ramp_epochs:
+        max_weight = 0.005
+        if self.current_epoch >= skip_epochs + ramp_epochs:
             return max_weight
-        return max_weight * (self.current_epoch / ramp_epochs)
+        if self.current_epoch <= skip_epochs:
+            return 0.0
+
+        progress = (self.current_epoch - skip_epochs) / ramp_epochs
+        return max_weight * (1 - np.cos(np.pi * progress)) / 2
 
     @property
     def checkpoint_path(self) -> Path:
@@ -571,7 +590,10 @@ class ScatteringLitModule(pl.LightningModule):
         predictions = self(x)
 
         mse_loss = self.mse_criterion(predictions[..., 0:2], y[..., 0:2])
-        derivative_loss = self.derivative_criterion(x, predictions, y)
+        if np.isclose(self.derivative_weight, 0.0):
+            derivative_loss = torch.tensor(0.0, device=self.device)
+        else:
+            derivative_loss = self.derivative_criterion(x, predictions, y)
 
         loss = mse_loss + self.derivative_weight * derivative_loss
 
@@ -672,21 +694,6 @@ def train_model(
         ckpt_path=model_entry.checkpoint_path
         if model_entry.checkpoint_path.exists()
         else None,
-    )
-
-
-def get_flat_condition(condition: MorseScatteringCondition) -> MorseScatteringCondition:
-    return MorseScatteringCondition(
-        mass=condition.mass,
-        incident_k=condition.incident_k,
-        morse_parameters=operator.build.CorrugatedMorseParameters(
-            depth=condition.morse_parameters.depth,
-            height=condition.morse_parameters.height,
-            offset=condition.morse_parameters.offset,
-            beta=0,
-        ),
-        metadata=condition.metadata,
-        units=condition.units,
     )
 
 
@@ -867,7 +874,7 @@ if __name__ == "__main__":
 
     model_zoo: list[ScatteringLitModule] = [
         ScatteringLitModule(
-            name="ComplexNN3",
+            name="ComplexNN4",
             should_train=True,
             base_path=Path("data/processed_state"),
             model=ComplexNN(param_dim=6, hidden_dim=256, num_blocks=6),
@@ -877,7 +884,7 @@ if __name__ == "__main__":
         if m.should_train:
             train_model(m, epochs=1000)
 
-    fig, ax = plot_channel_predictions(model_zoo, channel=(1, 0))
+    fig, ax = plot_channel_predictions(model_zoo, channel=(0, 0))
     fig.savefig("data/processed_state/specular_predictions.pdf")
 
     fig, ax = plot_real_space_predictions(model_zoo)
