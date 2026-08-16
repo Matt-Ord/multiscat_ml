@@ -438,24 +438,6 @@ class ComplexNN(nn.Module):
         )
 
         self.head = nn.Linear(hidden_dim, 2)
-        self.init_weights()
-
-    def init_weights(self) -> None:
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_uniform_(
-                    m.weight, a=0, mode="fan_in", nonlinearity="relu"
-                )
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-        for block in self.res_blocks:
-            if hasattr(block, "net") and isinstance(block.net[-1], nn.Linear):  # ty: ignore[not-subscriptable]
-                nn.init.zeros_(block.net[-1].weight)  # ty: ignore[not-subscriptable]
-
-        nn.init.normal_(self.head.weight, std=1e-2)
-        if self.head.bias is not None:
-            nn.init.zeros_(self.head.bias)
 
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -586,36 +568,30 @@ class ScatteringLitModule(pl.LightningModule):
         self, batch: tuple[torch.Tensor, torch.Tensor], _batch_idx: int
     ) -> torch.Tensor:
         x, y = batch
-        x = x.requires_grad_()
         predictions = self(x)
 
         mse_loss = self.mse_criterion(predictions[..., 0:2], y[..., 0:2])
+
         if np.isclose(self.derivative_weight, 0.0):
             derivative_loss = torch.tensor(0.0, device=self.device)
         else:
-            derivative_loss = self.derivative_criterion(x, predictions, y)
+            subsample_fraction = 0.1
+            n_points = x.shape[1]
+            subsample_size = max(1, int(n_points * subsample_fraction))
+
+            idx = torch.rand(n_points, device=self.device).topk(subsample_size).indices
+
+            x_sub = x[:, idx, :].detach().clone().requires_grad_()
+            y_sub = y[:, idx, :]
+
+            predictions_sub = self(x_sub)
+            derivative_loss = self.derivative_criterion(x_sub, predictions_sub, y_sub)
 
         loss = mse_loss + self.derivative_weight * derivative_loss
 
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log(
-            "train_mse_loss", mse_loss, on_step=False, on_epoch=True, prog_bar=False
-        )
-        self.log(
-            "train_derivative_loss",
-            derivative_loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=False,
-        )
-
-        self.log(
-            "derivative_weight",
-            self.derivative_weight,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=False,
-        )
+        self.log("train_mse_loss", mse_loss, on_step=False, on_epoch=True)
+        self.log("train_derivative_loss", derivative_loss, on_step=False, on_epoch=True)
 
         return loss
 
@@ -668,6 +644,7 @@ def train_model(
         monitor="val_loss",
         mode="min",
         save_top_k=1,
+        save_last=True,
     )
 
     early_stop_callback = EarlyStopping(
@@ -675,8 +652,16 @@ def train_model(
         patience=max_epochs_without_improvement,
         mode="min",
     )
-    csv_logger = CSVLogger(save_dir=model_entry.base_path, name=model_entry.name)
-    tb_logger = TensorBoardLogger(save_dir=model_entry.base_path, name=model_entry.name)
+    csv_logger = CSVLogger(
+        save_dir=model_entry.base_path,
+        name=model_entry.name,
+        version=0,
+    )
+    tb_logger = TensorBoardLogger(
+        save_dir=model_entry.base_path,
+        name=model_entry.name,
+        version=1,
+    )
     trainer = pl.Trainer(
         max_epochs=epochs,
         gradient_clip_val=1.0,
@@ -686,7 +671,7 @@ def train_model(
         logger=[csv_logger, tb_logger],
         log_every_n_steps=10,
     )
-
+    torch.serialization.add_safe_globals([pathlib.PosixPath, pathlib.WindowsPath])
     trainer.fit(
         model_entry,
         train_dataloaders=train_loader,
@@ -874,7 +859,7 @@ if __name__ == "__main__":
 
     model_zoo: list[ScatteringLitModule] = [
         ScatteringLitModule(
-            name="ComplexNN4",
+            name="ComplexNN6",
             should_train=True,
             base_path=Path("data/processed_state"),
             model=ComplexNN(param_dim=6, hidden_dim=256, num_blocks=6),
