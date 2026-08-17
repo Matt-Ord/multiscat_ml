@@ -42,13 +42,6 @@ if TYPE_CHECKING:
     from pytorch_lightning.utilities.types import OptimizerLRSchedulerConfig
 
 
-if torch.cuda.is_available():
-    DEVICE = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")  # pyright: ignore[reportConstantRedefinition]
-else:
-    DEVICE = torch.device("cpu")  # pyright: ignore[reportConstantRedefinition]
-
 PARAMS_MIN = np.array([0.1], dtype=np.float64)
 PARAMS_MAX = np.array([2.0], dtype=np.float64)
 
@@ -685,7 +678,7 @@ def train_model(
 def get_predicted_stable_state(
     model: nn.Module,
     params: np.ndarray[tuple[int], np.dtype[np.float64]],
-    grid_shape: tuple[int, int] = (80, 80),
+    grid_shape: tuple[int, int] = (18, 18),
 ) -> np.ndarray[tuple[int, int, int], np.dtype[np.complex128]]:
     """Predict the stable state from the given parameters using the trained model."""
     condition = condition_from_params(params)
