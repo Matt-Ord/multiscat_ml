@@ -263,6 +263,10 @@ class PureMLP(nn.Module):
         output_dim: int = 2,
         dropout_rate: float = 0.05,
     ) -> None:
+        """Map the coordinates (n, m, z) to the wavefunction at the point for a pointwise flexible mapping.
+
+        Plain MLP is used for simplicity, but the model is currently laboured under severe spectral bias
+        """
         super().__init__()
 
         self.param_dim = param_dim
@@ -352,6 +356,11 @@ def predict_chi_batch_from_params(  # ruff: ignore[too-many-arguments]  # ruff: 
 
 
 class ApplyLUFn(torch.autograd.Function):
+    """Define the lhs action: (1 + L^-1 U) psi in the linear equation the GMRES solves.
+
+    This class also defines the adjoint action for the back propagation in the gradient descent calculation for the training.
+    """
+
     @staticmethod
     def forward(  # ruff: ignore[too-many-arguments]  # ruff: ignore[too-many-positional-arguments]
         ctx: Any,  # ruff: ignore[any-type]
@@ -430,7 +439,7 @@ def save_loss_history(loss_history: dict, path: str | Path) -> None:
 
 
 def plot_training_convergence(history: dict, save_path: Path) -> None:
-    """Generate a publication-grade log-scale convergence plot."""
+    """Generate a log-scale convergence plot."""
     # Use a clean aesthetic style
     plt.style.use(
         "seaborn-v0_8-whitegrid"
@@ -465,7 +474,7 @@ def plot_training_convergence(history: dict, save_path: Path) -> None:
     ax.set_xlabel("Epochs", fontsize=12, fontweight="bold", labelpad=10)
     ax.set_ylabel("Loss (Log Scale)", fontsize=12, fontweight="bold", labelpad=10)
     ax.set_title(
-        "Model Convergence Profile Across Real Position Space",
+        "Model Convergence Profile",
         fontsize=13,
         fontweight="bold",
         pad=15,
@@ -781,7 +790,7 @@ def test() -> None:  # ruff: ignore[too-many-locals] # ruff: ignore[too-many-sta
     forward_model = PureMLP().to(DEVICE)
     forward_model.load_state_dict(
         torch.load(
-            "data/state_model/best_chi_model.pth",
+            "data/state_model/chi_model.pth",
             map_location=DEVICE,
         ),
     )
@@ -970,7 +979,7 @@ def test_adjoint(_nx: int = 9, _ny: int = 9, _nz: int = 100) -> None:  # ruff: i
 
 
 if __name__ == "__main__":
-    RUN_TRAIN_RAND = True
+    RUN_TRAIN_RAND = False
     RUN_TEST = True
 
     if RUN_TRAIN_RAND:
