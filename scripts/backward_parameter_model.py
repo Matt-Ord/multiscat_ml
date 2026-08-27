@@ -1,5 +1,4 @@
 import contextlib
-import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, override
@@ -19,11 +18,13 @@ from scipy.constants import (  # type: ignore[import-untyped]
     electron_volt,
     physical_constants,
 )
-from slate_core import Array, AsUpcast, basis
+from slate_core import AsUpcast, basis
 from slate_quantum import operator
 from torch import nn, optim
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
 from tqdm import tqdm
+
+from multiscat_ml.utils import plot_training_convergence, save_loss_history
 
 # Constants
 HELIUM_MASS = physical_constants["alpha particle mass"][0]
@@ -37,8 +38,8 @@ elif torch.backends.mps.is_available():
 else:
     DEVICE = torch.device("cpu")  # pyright: ignore[reportConstantRedefinition]
 
-PARAMS_MIN = np.array([5.0, 0.5, 0.05, 2.5, 0.0], dtype=np.float64)
-PARAMS_MAX = np.array([15.0, 1.2, 0.20, 4.0, 2 * np.pi / 5], dtype=np.float64)
+PARAMS_MIN = np.array([15.0, 0.5, 0.05, 2.5, 0.0], dtype=np.float64)
+PARAMS_MAX = np.array([20.0, 1.2, 0.20, 4.0, 2 * np.pi / 5], dtype=np.float64)
 OFFSET = 1.0
 Nx, Ny, Nz = 11, 11, 100
 potential_channels = 11
@@ -63,7 +64,7 @@ def corrugated_morse_real_space(  # ruff: ignore[too-many-arguments]  # ruff: ig
     z: torch.Tensor | np.ndarray,
     a: float,
 ) -> torch.Tensor:
-    """Return (2, n_channels, n_channels, nz): [real, imag] stacked on axis 0."""
+    """Return (n_channels, n_channels, nz)."""
     z = torch.as_tensor(z, device=DEVICE, dtype=torch.float32)
     x = torch.as_tensor(x, device=DEVICE, dtype=torch.float32)
     y = torch.as_tensor(y, device=DEVICE, dtype=torch.float32)
@@ -159,7 +160,7 @@ def corrugated_morse_channels(  # ruff: ignore[too-many-arguments]
     beta: float,
     n_channels: int = potential_channels,
 ) -> torch.Tensor:
-    """Return (n_channels, n_channels, nz): [real, imag] stacked on axis 0."""
+    """Return potential in the shape (n_channels, n_channels, nz)."""
     z = torch.as_tensor(z, dtype=torch.float32)
 
     t = torch.exp(-(z - offset) / height)
@@ -196,48 +197,6 @@ def get_morse_potential(
         beta=float(beta),
         n_channels=n_channels,
     )
-
-
-def intensity_map_from_actual(
-    actual: (Array[Any, np.dtype[np.complex128]]),
-    *,
-    threshold: float = 1e-8,
-) -> list[tuple[int, int, float]]:
-    """Convert scattering output into a sparse channel map of (kx, ky, intensity)."""
-    data = actual.raw_data.reshape(actual.basis.metadata().shape)
-
-    # Keep the FFT-style channel ordering used by multiscat plots.
-    # For odd N: 0..N//2,-N//2..-1. For even N: 0..N/2-1,-N/2..-1.
-    def _fft_channel_indices(size: int) -> list[int]:
-        half = size // 2
-        if size % 2 == 0:
-            return [*range(half), *range(-half, 0)]
-        return [*range(half + 1), *range(-half, 0)]
-
-    nx, ny = data.shape
-    kx_values = _fft_channel_indices(nx)
-    ky_values = _fft_channel_indices(ny)
-
-    rows: list[tuple[int, int, float]] = []
-    for i, kx in enumerate(kx_values):
-        for j, ky in enumerate(ky_values):
-            intensity = float(np.abs(data[i, j]))
-            if intensity > threshold:
-                rows.append((int(kx), int(ky), intensity))
-
-    return rows
-
-
-def format_intensity_map(
-    actual: (Array[Any, np.dtype[np.complex128]]),
-    *,
-    threshold: float = 1e-8,
-) -> str:
-    """Format scattering output as a text intensity map."""
-    rows = intensity_map_from_actual(actual, threshold=threshold)
-    lines = ["# kx ky intensity"]
-    lines.extend(f"{kx:4d} {ky:4d}  {intensity:.8e}" for kx, ky, intensity in rows)
-    return "\n".join(lines)
 
 
 class CoordMLP(nn.Module):
@@ -287,6 +246,11 @@ def _make_s_coords(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    """
+    Generate the channel indices in FFT-style orders.
+
+    This will be fed to the CoordMLP for the index mapping required for a flexible S -> params model.
+    """
     xs = torch.fft.fftfreq(nx, d=1.0 / nx).to(device=device, dtype=dtype)
     ys = torch.fft.fftfreq(ny, d=1.0 / ny).to(device=device, dtype=dtype)
 
@@ -321,9 +285,7 @@ class JointKernelBackwardNet(nn.Module):
         cond_dim = encoder_dim if use_encoder else 0
 
         # Split embedding again, for the same reason as in the separable model:
-        # the (n, m, n', m', z) term has no batch axis, so computing it once
-        # per (channel, query) pair rather than once per (sample, channel,
-        # query) triple is a straight factor-of-B saving on the first matmul.
+        # the (n, m, n', m', z) term has no batch axis, so computing it once.
         self.embed_coords = nn.Linear(s_idx_dim, hidden_dim, bias=True)
         self.embed_cond = (
             nn.Linear(cond_dim, hidden_dim, bias=False) if cond_dim else None
@@ -336,7 +298,11 @@ class JointKernelBackwardNet(nn.Module):
         self.head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, 5))
 
     def encode(self, s_coords: torch.Tensor, s_values: torch.Tensor) -> torch.Tensor:
-        """(N, 2), (B, N) -> (B, encoder_dim)."""
+        """
+        (N, 2), (B, N) -> (B, encoder_dim).
+
+        Encoder (global features) is fed to the index mapping for nonlinearity.
+        """
         kernel = self.encoder(s_coords)  # ty: ignore[call-non-callable]
         return torch.einsum("nd,bn->bd", kernel, s_values)
 
@@ -345,14 +311,19 @@ class JointKernelBackwardNet(nn.Module):
         s_coords: torch.Tensor,  # (N, 2)
         cond: torch.Tensor | None,  # (B, cond_dim) or None
     ) -> torch.Tensor:
-        """Return C with shape (B, N, 5), or (1, N, 5) when cond is None."""
+        """
+        Return C with shape (B, N, 5), or (1, N, 5) when cond is None.
+
+        This is the resultant index mapping used to build the S -> params tensor, features of S is mixed in the tensor via the learnt encoder,
+        so this map is nonlinear.
+        """
         h = self.embed_coords(s_coords).unsqueeze(0)  # (1, N, H)
         if cond is not None and self.embed_cond is not None:
             h = h + self.embed_cond(cond)[:, None, :]  # noqa: PLR6104
 
         x = self.embed_norm(h)
         x = self.res_blocks(x)
-        return self.head(x)  # (B, N, 6)
+        return self.head(x)  # (B, N, 5)
 
     @override
     def forward(
@@ -377,7 +348,7 @@ def predict_potential_params(
     nx: int,
     ny: int,
 ) -> torch.Tensor:
-    """Parameter regression. Returns (B, 6)."""
+    """Parameter regression. Returns (B, 5)."""
     device, dtype = s_matrix.device, s_matrix.dtype
     s_coords = _make_s_coords(nx, ny, device, dtype)
     s_flat = s_matrix.reshape(s_matrix.shape[0], -1)
@@ -418,12 +389,27 @@ def generate_dataset_hdf5(filepath: Path, num_samples: int = 1000) -> None:
             dtype=np.float64,
         )
 
-        for i in range(num_samples):
-            print(f"Generating sample {i + 1}/{num_samples}")
+        n_written = 0
+        n_failed = 0
+        max_failures = 10 * num_samples
+        while n_written < num_samples and n_failed < max_failures:
             params = rng.uniform(size=5)
+            try:
+                s_matrix = simulate_s_matrix(params)
+            except RuntimeError as e:  # GMRES did not converge
+                n_failed += 1
+                print(f"  skipped non-converged sample ({n_failed} so far): {e}")
+                continue
 
-            input_data[i] = params
-            s_data[i] = simulate_s_matrix(params)
+            input_data[n_written] = params
+            s_data[n_written] = s_matrix
+            n_written += 1
+            print(f"Generating sample {n_written}/{num_samples}")
+
+        # trim off any rows never written, so no zero-filled samples remain
+        input_data.resize(n_written, axis=0)
+        s_data.resize(n_written, axis=0)
+        f.attrs["n_failed"] = n_failed
 
 
 class HDF5ScatteringDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
@@ -479,7 +465,7 @@ def freeze_parameters(model: nn.Module) -> Any:  # noqa: ANN401
 
 
 def generate() -> None:
-    for i in range(50, 200):
+    for i in range(10, 15):
         data_path = Path(f"data/backward_model/training_data_5params/dataset.{i}.hdf5")
         generate_dataset_hdf5(data_path, num_samples=1000)
 
@@ -489,7 +475,7 @@ def load_datasets() -> ConcatDataset[tuple[torch.Tensor, torch.Tensor]]:
         HDF5ScatteringDataset(
             Path(f"data/backward_model/training_data_5params/dataset.{i}.hdf5")
         )
-        for i in range(50, 200)
+        for i in range(20)
     ]
     return ConcatDataset[tuple[torch.Tensor, torch.Tensor]](datasets)
 
@@ -497,63 +483,6 @@ def load_datasets() -> ConcatDataset[tuple[torch.Tensor, torch.Tensor]]:
 def flat_channel_index(nx: int, ny: int, nz: int, device: torch.device) -> torch.Tensor:
     """(P,) mapping each flattened query point to its (n, m) channel id."""
     return torch.arange(nx * ny * nz, device=device) // nz
-
-
-def save_loss_history(loss_history: dict, path: str | Path) -> None:
-    path = Path(path)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(loss_history, f, indent=4)
-
-
-def plot_training_convergence(history: dict, save_path: Path) -> None:
-    """Generate a publication-grade log-scale convergence plot."""
-    # Use a clean aesthetic style
-    plt.style.use(
-        "seaborn-v0_8-whitegrid"
-        if "seaborn-v0_8-whitegrid" in plt.style.available
-        else "default"
-    )
-
-    _fig, ax = plt.subplots(figsize=(8, 5), dpi=300)
-    epochs_range = range(1, len(history["train_loss"]) + 1)
-
-    # Plot training and validation tracks
-    ax.plot(
-        epochs_range,
-        history["train_loss"],
-        label="Training Loss",
-        color="#1f77b4",
-        linewidth=2,
-    )
-    ax.plot(
-        epochs_range,
-        history["val_loss"],
-        label="Validation Loss",
-        color="#ff7f0e",
-        linewidth=2,
-        linestyle="--",
-    )
-
-    # Crucial scientific step: Logarithmic scale for wide dynamic ranges
-    ax.set_yscale("log")
-
-    # Labels and metadata
-    ax.set_xlabel("Epochs", fontsize=12, fontweight="bold", labelpad=10)
-    ax.set_ylabel("Loss (Log Scale)", fontsize=12, fontweight="bold", labelpad=10)
-    ax.set_title(
-        "Model Convergence Profile Across Real Position Space",
-        fontsize=13,
-        fontweight="bold",
-        pad=15,
-    )
-
-    ax.legend(frameon=True, facecolor="white", edgecolor="none", fontsize=11)
-    ax.tick_params(axis="both", labelsize=10)
-
-    plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
-    plt.close()
-    print(f"--> Convergence plot saved to: {save_path}")
 
 
 def train(  # noqa: PLR0914 # ruff: ignore[too-many-arguments]  # ruff: ignore[too-many-statements]
@@ -794,8 +723,8 @@ def test(  # ruff: ignore[too-many-arguments]  # ruff: ignore[too-many-locals]
 
 if __name__ == "__main__":
     RUN_GENERATE = True
-    RUN_TRAIN = True
-    RUN_TEST = True
+    RUN_TRAIN = False
+    RUN_TEST = False
 
     if RUN_GENERATE:
         generate()
