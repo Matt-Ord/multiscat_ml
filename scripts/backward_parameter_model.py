@@ -389,27 +389,12 @@ def generate_dataset_hdf5(filepath: Path, num_samples: int = 1000) -> None:
             dtype=np.float64,
         )
 
-        n_written = 0
-        n_failed = 0
-        max_failures = 10 * num_samples
-        while n_written < num_samples and n_failed < max_failures:
+        for i in range(num_samples):
+            print(f"Generating sample {i + 1}/{num_samples}")
             params = rng.uniform(size=5)
-            try:
-                s_matrix = simulate_s_matrix(params)
-            except RuntimeError as e:  # GMRES did not converge
-                n_failed += 1
-                print(f"  skipped non-converged sample ({n_failed} so far): {e}")
-                continue
 
-            input_data[n_written] = params
-            s_data[n_written] = s_matrix
-            n_written += 1
-            print(f"Generating sample {n_written}/{num_samples}")
-
-        # trim off any rows never written, so no zero-filled samples remain
-        input_data.resize(n_written, axis=0)
-        s_data.resize(n_written, axis=0)
-        f.attrs["n_failed"] = n_failed
+            input_data[i] = params
+            s_data[i] = simulate_s_matrix(params)
 
 
 class HDF5ScatteringDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
