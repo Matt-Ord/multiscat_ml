@@ -1,5 +1,4 @@
 import contextlib
-import io
 import json
 import time
 from pathlib import Path
@@ -17,7 +16,6 @@ from multiscat.basis import (
     split_scattering_metadata,
 )
 from multiscat.config import MorseScatteringCondition, momentum_from_angles
-from PIL import Image
 from scipy.constants import angstrom as angstrom_si  # type: ignore[import-untyped]
 from scipy.constants import (  # type: ignore[import-untyped]
     electron_volt,
@@ -28,6 +26,8 @@ from slate_quantum import operator
 from torch import nn, optim
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
 from tqdm import tqdm
+
+from multiscat_ml.utils import plot_training_convergence, save_loss_history
 
 # Constants
 HELIUM_MASS = physical_constants["alpha particle mass"][0]
@@ -149,7 +149,7 @@ def corrugated_morse_channels(  # ruff: ignore[too-many-arguments]
     beta: float,
     n_channels: int = potential_channels,
 ) -> torch.Tensor:
-    """Return (n_channels, n_channels, nz): [real, imag] stacked on axis 0."""
+    """Return the reciprocal space potential in the shape (n_channels, n_channels, nz)."""
     z = torch.as_tensor(z, dtype=torch.float32)
 
     t = torch.exp(-(z - offset) / height)
@@ -177,7 +177,7 @@ def corrugated_morse_real_space(  # ruff: ignore[too-many-arguments]  # ruff: ig
     z: torch.Tensor | np.ndarray,
     a: float,
 ) -> torch.Tensor:
-    """Return (2, n_channels, n_channels, nz): [real, imag] stacked on axis 0."""
+    """Return the real space potential in the shape (n_channels, n_channels, nz)."""
     z = torch.as_tensor(z, device=DEVICE, dtype=torch.float32)
     x = torch.as_tensor(x, device=DEVICE, dtype=torch.float32)
     y = torch.as_tensor(y, device=DEVICE, dtype=torch.float32)
@@ -206,49 +206,13 @@ def get_potential(params: torch.Tensor | np.ndarray, z: torch.Tensor) -> torch.T
     )
 
 
-def intensity_map_from_actual(
-    actual: (Array[Any, np.dtype[np.complex128]]),
-    *,
-    threshold: float = 1e-8,
-) -> list[tuple[int, int, float]]:
-    """Convert scattering output into a sparse channel map of (kx, ky, intensity)."""
-    data = actual.raw_data.reshape(actual.basis.metadata().shape)
-
-    # Keep the FFT-style channel ordering used by multiscat plots.
-    # For odd N: 0..N//2,-N//2..-1. For even N: 0..N/2-1,-N/2..-1.
-    def _fft_channel_indices(size: int) -> list[int]:
-        half = size // 2
-        if size % 2 == 0:
-            return [*range(half), *range(-half, 0)]
-        return [*range(half + 1), *range(-half, 0)]
-
-    nx, ny = data.shape
-    kx_values = _fft_channel_indices(nx)
-    ky_values = _fft_channel_indices(ny)
-
-    rows: list[tuple[int, int, float]] = []
-    for i, kx in enumerate(kx_values):
-        for j, ky in enumerate(ky_values):
-            intensity = float(np.abs(data[i, j]))
-            if intensity > threshold:
-                rows.append((int(kx), int(ky), intensity))
-
-    return rows
-
-
-def format_intensity_map(
-    actual: (Array[Any, np.dtype[np.complex128]]),
-    *,
-    threshold: float = 1e-8,
-) -> str:
-    """Format scattering output as a text intensity map."""
-    rows = intensity_map_from_actual(actual, threshold=threshold)
-    lines = ["# kx ky intensity"]
-    lines.extend(f"{kx:4d} {ky:4d}  {intensity:.8e}" for kx, ky, intensity in rows)
-    return "\n".join(lines)
-
-
 class GlobalPotentialEncoder(nn.Module):
+    """
+    Learn the mapping from the potential coordinates (n, m, z) to a vector of size out_dim.
+
+    The out_dim depends on the complexity of the potential. This map is used to build the encoder to be fed to the core model.
+    """
+
     def __init__(self, grid_shape: tuple[int, int, int], out_dim: int) -> None:
         super().__init__()
         self.grid_shape = tuple(grid_shape)
@@ -265,7 +229,7 @@ class GlobalPotentialEncoder(nn.Module):
 
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, Nx, Ny, Nz) with channel 0 = Re, channel 1 = Im
+        # x: (B, Nx, Ny, Nz)
         if x.ndim == 5:  # ruff: ignore[magic-value-comparison]
             x = x[:, 0]  # -> (B, Nx, Ny, Nz), non-contiguous
         elif x.ndim != 4:  # ruff: ignore[magic-value-comparison]
@@ -302,7 +266,7 @@ class ResBlock(nn.Module):
 
 
 class ForwardModel(nn.Module):
-    """Predicts chi (one positive scalar per (n,m) point) from particle params and the full real-valued reciprocal-space potential lattice."""
+    """Predicts S (one positive scalar per (n,m) point) from particle params and the local and the global features of the reciprocal-space potential lattice."""
 
     def __init__(  # ruff: ignore[too-many-arguments]  # ruff: ignore[too-many-positional-arguments]
         self,
@@ -322,6 +286,7 @@ class ForwardModel(nn.Module):
         self.grid_shape = grid_shape
         self.output_shape = output_shape
         self.Npts = int(np.prod(grid_shape))
+        # learnt global feature from a sub-network, increase the encoder_dim if the potential gets more complicated
         self.global_encoder = GlobalPotentialEncoder((Nx, Ny, potential_z), encoder_dim)
 
         in_dim = input_dim + self.Npts + encoder_dim + coord_dim
@@ -346,6 +311,7 @@ class ForwardModel(nn.Module):
         local_potential: torch.Tensor,  # (B*N, Nz)
         global_feature: torch.Tensor,  # (B*N, encoder_dim)
     ) -> torch.Tensor:
+        # mix and align the inputs to match the shape of coords for a pointwise mapping
         x = self.embedding(
             torch.cat([params, coords, local_potential, global_feature], dim=-1)
         )
@@ -383,6 +349,7 @@ def predict_chi_batch_from_params(  # ruff: ignore[too-many-arguments]  # ruff: 
     ny: int,
     z: torch.Tensor,
 ) -> torch.Tensor:
+    """Format the model ouput for comparison with the target."""
     b = params_batch.shape[0]
     n_pts = coords.shape[0]
     device, dtype = params_batch.device, params_batch.dtype
@@ -394,6 +361,7 @@ def predict_chi_batch_from_params(  # ruff: ignore[too-many-arguments]  # ruff: 
 
     # per-condition quantities: computed once, then repeated N times each
     global_feature = forward_model.global_encoder(potential_batch)  # ty: ignore[call-non-callable]
+    # feed the original potential along with the learnt global feature
     local = potential_batch[:, coords[:, 0].long(), coords[:, 1].long()]  # (B, N, Nz)
 
     coords_flat = coords.unsqueeze(0).expand(b, n_pts, 2).reshape(b * n_pts, 2)
@@ -507,59 +475,6 @@ def load_datasets() -> ConcatDataset[tuple[torch.Tensor, torch.Tensor]]:
     return ConcatDataset[tuple[torch.Tensor, torch.Tensor]](datasets)
 
 
-class FluxConservationLoss(nn.Module):
-    """Fixes the total sum of the scattering matrix (flux conservation/unitarity)."""
-
-    def __init__(self, reduction: str = "mean") -> None:
-        super().__init__()
-        self.reduction = reduction
-
-    @override
-    def forward(
-        self,
-        s_mat_pred: torch.Tensor,
-        s_mat_true: torch.Tensor,
-    ) -> torch.Tensor:
-        # Sum over the 15x15 grid (dimensions 1 and 2 for batch processing)
-        pred_sum = torch.sum(s_mat_pred, dim=(1, 2))
-        target_sum = torch.sum(s_mat_true, dim=(1, 2))
-
-        # Calculate the MSE between the predicted sums and the true sums
-        return torch.nn.functional.mse_loss(
-            pred_sum,
-            target_sum,
-            reduction=self.reduction,
-        )
-
-
-class TotalScatteringLoss(nn.Module):
-    """Combines standard data loss (MSE) with the physics-informed flux loss."""
-
-    def __init__(self, lambda_physics: float = 0.1) -> None:
-        super().__init__()
-        self.data_criterion = nn.MSELoss()
-        self.physics_criterion = FluxConservationLoss()
-        self.lambda_physics = lambda_physics
-
-    @override
-    def forward(
-        self,
-        s_mat_pred: torch.Tensor,
-        s_mat_true: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # 1. Standard pixel-wise MSE
-        loss_data = self.data_criterion(s_mat_pred, s_mat_true)
-
-        # 2. Physics sum penalty
-        loss_physics = self.physics_criterion(s_mat_pred, s_mat_true)
-
-        # 3. Combined total loss
-        loss_total = loss_data + (self.lambda_physics * loss_physics)
-
-        # Returning all three allows you to log them separately in your training loop
-        return loss_total, loss_data, loss_physics
-
-
 class SparseScatteringLoss(nn.Module):
     def __init__(
         self,
@@ -591,330 +506,7 @@ class SparseScatteringLoss(nn.Module):
         return weighted_mse + (self.sparsity_weight * sparsity_loss)
 
 
-class SparseAndFluxScatteringLoss(nn.Module):
-    def __init__(
-        self,
-        peak_weight: float = 10.0,
-        sparsity_weight: float = 1e-4,
-        physics_weight: float = 5e-5,
-    ) -> None:
-        super().__init__()
-        self.peak_weight = peak_weight
-        self.sparsity_weight = sparsity_weight
-        self.mse = nn.MSELoss(reduction="none")  # Notice reduction='none'
-        self.physics_weights = physics_weight
-        self.physics = FluxConservationLoss()
-
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        # 1. Calculate the raw, un-averaged pixel-wise squared error
-        base_error = self.mse(y_pred, y_true)
-
-        # 2. Intensity Weighting
-        # Create a mask where empty channels equal 1.0, and bright channels > 1.0
-        # Example: If a peak has intensity 0.1 and weight is 100, its multiplier becomes 11.0
-        weight_mask = 1.0 + (self.peak_weight * y_true)
-
-        # Apply the weight and take the mean
-        weighted_mse = torch.mean(base_error * weight_mask)
-
-        # 3. Sparsity Penalty (L1)
-        # This constantly applies a tiny downward pressure on all predicted values,
-        # forcing the network to snap the background noise to exactly 0.0
-        sparsity_loss = torch.mean(torch.abs(y_pred))
-
-        # 4. Apply soft total flux criterion
-        flux_loss = self.physics(y_pred, y_true)
-
-        return (
-            weighted_mse
-            + (self.sparsity_weight * sparsity_loss)
-            + (self.peak_weight * flux_loss)
-        )
-
-
-def save_loss_history(loss_history: dict, path: str | Path) -> None:
-    path = Path(path)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(loss_history, f, indent=4)
-
-
-def plot_training_convergence(history: dict, save_path: Path) -> None:
-    """Generate a publication-grade log-scale convergence plot."""
-    # Use a clean aesthetic style
-    plt.style.use(
-        "seaborn-v0_8-whitegrid"
-        if "seaborn-v0_8-whitegrid" in plt.style.available
-        else "default"
-    )
-
-    _fig, ax = plt.subplots(figsize=(8, 5), dpi=300)
-    epochs_range = range(1, len(history["train_loss"]) + 1)
-
-    # Plot training and validation tracks
-    ax.plot(
-        epochs_range,
-        history["train_loss"],
-        label="Training Loss",
-        color="#1f77b4",
-        linewidth=2,
-    )
-    ax.plot(
-        epochs_range,
-        history["val_loss"],
-        label="Validation Loss",
-        color="#ff7f0e",
-        linewidth=2,
-        linestyle="--",
-    )
-
-    # Crucial scientific step: Logarithmic scale for wide dynamic ranges
-    ax.set_yscale("log")
-
-    # Labels and metadata
-    ax.set_xlabel("Epochs", fontsize=12, fontweight="bold", labelpad=10)
-    ax.set_ylabel("Loss (Log Scale)", fontsize=12, fontweight="bold", labelpad=10)
-    ax.set_title(
-        "Model Convergence Profile Across Real Position Space",
-        fontsize=13,
-        fontweight="bold",
-        pad=15,
-    )
-
-    ax.legend(frameon=True, facecolor="white", edgecolor="none", fontsize=11)
-    ax.tick_params(axis="both", labelsize=10)
-
-    plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
-    plt.close()
-    print(f"--> Convergence plot saved to: {save_path}")
-
-
-class TrainingSnapshotter:
-    """Capture surrogate predictions on a fixed condition during training."""
-
-    def __init__(
-        self,
-        condition: Any,  # ruff: ignore[any-type]
-        coords: torch.Tensor,
-        out_dir: Path,
-        every: int = 1,
-        n_channels: int = 400,
-    ) -> None:
-        self.coords = coords
-        self.every = every
-        self.out_dir = out_dir
-        self.nx, self.ny, _ = condition.metadata.shape
-
-        self.params = (
-            torch.tensor(
-                params_from_condition(condition),
-                dtype=torch.float32,
-            )
-            .unsqueeze(0)
-            .to(DEVICE)
-        )
-
-        # Ground truth: expensive, computed ONCE for the whole run.
-        actual = get_scattering_matrix(
-            condition,
-            OptimizationConfig(
-                precision=1e-5, max_iterations=1000, n_channels=n_channels
-            ),
-            backend="scipy",
-        )
-        self.actual = np.asarray(actual.raw_data).real.reshape(self.nx, self.ny)
-
-        self.frames: list[np.ndarray] = []
-        self.epochs: list[int] = []
-        self.val_losses: list[float] = []
-
-    def capture(self, model: nn.Module, epoch: int, val_loss: float) -> None:
-        if epoch % self.every:
-            return
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
-            pred = predict_chi_batch_from_params(
-                model,
-                self.params,
-                self.coords,
-                self.nx,
-                self.ny,
-                z,
-            )[0]
-        if was_training:
-            model.train()
-
-        self.frames.append(
-            np.asarray(pred.detach().cpu().numpy()).real.reshape(self.nx, self.ny)
-        )
-        self.epochs.append(epoch)
-        self.val_losses.append(val_loss)
-
-    def save(self) -> Path:
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        path = self.out_dir / "snapshots.npz"
-        np.savez_compressed(
-            path,
-            frames=np.stack(self.frames),
-            actual=self.actual,
-            epochs=np.array(self.epochs),
-            val_losses=np.array(self.val_losses),
-        )
-        return path
-
-
-FONT = {
-    "tick": 13,
-    "axis_label": 15,
-    "panel_title": 16,
-    "suptitle": 19,
-}
-
-
-def _centred(arr: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
-    """Move G = (0,0) from the FFT-order origin to the centre of the array."""
-    return np.fft.fftshift(np.asarray(arr), axes=(0, 1))
-
-
-def _channel_extent(shape: tuple[int, ...]) -> tuple[float, float, float, float]:
-    """Pixel-edge extent in channel indices, centred on G = 0."""
-    nx, ny = shape[0], shape[1]
-    x0 = -(nx // 2) - 0.5
-    y0 = -(ny // 2) - 0.5
-    return (x0, x0 + nx, y0, y0 + ny)
-
-
-def render_convergence_gif(  # ruff: ignore[too-many-locals]
-    npz_path: Path,
-    gif_path: Path,
-    fps: int = 15,
-    hold_last: int = 12,
-) -> None:
-    """Build a GIF from captured training snapshots."""
-    data = np.load(npz_path)
-    frames, actual = data["frames"], data["actual"]
-    epochs, val_losses = data["epochs"], data["val_losses"]
-
-    actual_centred = _centred(actual)
-    extent = _channel_extent(actual.shape)
-
-    # Fixed scale across every frame -- set by the ground truth, not the frame.
-    vmax = float(np.abs(actual).max())
-    vmin = 0.0
-
-    # Fixed loss-curve limits so the axis does not jump between frames.
-    finite = val_losses[np.isfinite(val_losses)]
-    loss_lim = (
-        (float(finite.min()) * 0.8, float(finite.max()) * 1.2)
-        if finite.size
-        else (1e-4, 1.0)
-    )
-
-    actual_norm = float(np.linalg.norm(actual.ravel()))
-
-    images: list[Image.Image] = []
-    for k, pred in enumerate(frames):
-        pred_centred = _centred(pred)
-        err_centred = np.abs(actual_centred - pred_centred)
-
-        fig, axes = plt.subplots(1, 4, figsize=(18, 4.6), constrained_layout=True)
-
-        panels = (
-            (pred_centred, "Prediction"),
-            (actual_centred, "Exact"),
-            (err_centred, r"$|$Exact $-$ Prediction$|$"),
-        )
-        for ax, (arr, title) in zip(axes[:3], panels, strict=True):
-            im = ax.imshow(
-                np.abs(arr).T,
-                origin="lower",
-                extent=extent,
-                vmin=vmin,
-                vmax=vmax,
-                interpolation="nearest",
-            )
-            ax.set_title(title, fontsize=FONT["panel_title"])
-            ax.set_xlabel("$n$", fontsize=FONT["axis_label"])
-            ax.tick_params(labelsize=FONT["tick"])
-        axes[0].set_ylabel("$m$", fontsize=FONT["axis_label"])
-        for ax in axes[1:3]:
-            ax.set_yticklabels([])
-
-        cbar = fig.colorbar(im, ax=axes[:3].tolist(), shrink=0.85, aspect=30)
-        cbar.ax.tick_params(labelsize=FONT["tick"])
-
-        # Loss curve revealed up to the current epoch.
-        ax = axes[3]
-        ax.plot(epochs[: k + 1], val_losses[: k + 1], lw=1.8, color="#1f4e79")
-        ax.scatter(epochs[k], val_losses[k], s=40, zorder=3, color="#1f4e79")
-        ax.set_xlim(float(epochs.min()), float(epochs.max()))
-        ax.set_ylim(*loss_lim)
-        ax.set_yscale("log")
-        ax.set_xlabel("Epoch", fontsize=FONT["axis_label"])
-        ax.set_ylabel("Validation loss", fontsize=FONT["axis_label"])
-        ax.tick_params(labelsize=FONT["tick"])
-        ax.grid(visible=True, alpha=0.3)
-
-        difference = actual - pred
-        rel_l2 = float(np.linalg.norm(difference.ravel()) / (actual_norm + 1e-12))
-        corr = float(
-            np.abs(np.vdot(actual.ravel(), pred.ravel()))
-            / (actual_norm * np.linalg.norm(pred.ravel()) + 1e-12)
-        )
-        fig.suptitle(
-            f"Epoch {epochs[k]:03d}     RelL2 = {rel_l2:.3f}     Corr = {corr:.4f}",
-            fontsize=FONT["suptitle"],
-        )
-
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=110)  # dpi FIXED -> identical frame sizes
-        plt.close(fig)
-        buf.seek(0)
-        images.append(Image.open(buf).convert("RGB"))
-
-    # One shared palette for every frame, otherwise the colours flicker.
-    palette_source = images[0].quantize(colors=256, method=Image.Quantize.MEDIANCUT)
-    quantised = [
-        im.quantize(palette=palette_source, dither=Image.Dither.NONE) for im in images
-    ]
-    quantised += [quantised[-1]] * hold_last  # linger on the converged result
-
-    quantised[0].save(
-        gif_path,
-        save_all=True,
-        append_images=quantised[1:],
-        duration=int(1000 / fps),
-        loop=0,
-        optimize=True,
-    )
-    print(f"--> Saved {gif_path}")
-
-
 def train() -> None:  # noqa: PLR0914   # ruff: ignore[too-many-statements]
-    snapshot_condition = MorseScatteringCondition(
-        mass=HELIUM_MASS,
-        morse_parameters=operator.build.CorrugatedMorseParameters(
-            depth=7.63 * electron_volt * 10**-3,
-            height=(1.0 / 1.1) * angstrom_si,
-            offset=1.0 * angstrom_si,
-            beta=0.05,
-        ),
-        metadata=scattering_metadata_from_stacked_delta_x(
-            (
-                np.array([3.0 * angstrom_si, 0, 0]),
-                np.array([0, 3.0 * angstrom_si, 0]),
-                np.array([0, 0, Z_HEIGHT * angstrom_si]),
-            ),
-            (15, 15, 200),
-        ),
-        incident_k=momentum_from_angles(
-            theta=np.deg2rad(45),
-            phi=np.deg2rad(0),
-            energy=HELIUM_ENERGY,
-            mass=HELIUM_MASS,
-        ),
-    )
     dataset = load_datasets()
     train_dataset, val_dataset = random_split(dataset, [0.8, 0.2])
 
@@ -951,14 +543,6 @@ def train() -> None:  # noqa: PLR0914   # ruff: ignore[too-many-statements]
         f"Validating on {len(val_dataset)} samples...",
     )
     print(f"Using device: {DEVICE}")
-
-    snapshotter = TrainingSnapshotter(
-        condition=snapshot_condition,  # factor the condition out of test()
-        coords=coords,
-        out_dir=output_dir,
-        every=2,
-    )
-    snapshotter.capture(forward_model, epoch=0, val_loss=float("nan"))  # untrained
 
     for epoch in range(epochs):
         forward_model.train()
@@ -1030,7 +614,6 @@ def train() -> None:  # noqa: PLR0914   # ruff: ignore[too-many-statements]
 
         # Step the schedulers
         scheduler_f.step(average_val_loss_f)
-        snapshotter.capture(forward_model, epoch + 1, average_val_loss_f)
 
         # Retrieve current learning rates for logging
         lr_f = forward_optimizer.param_groups[0]["lr"]
@@ -1056,8 +639,6 @@ def train() -> None:  # noqa: PLR0914   # ruff: ignore[too-many-statements]
             break
 
     print("Training complete.")
-    snap_path = snapshotter.save()
-    render_convergence_gif(snap_path, output_dir / "convergence.gif")
 
     with Path(output_dir / "loss_history.json").open("w", encoding="utf-8") as f:
         json.dump(loss_history, f, indent=4)

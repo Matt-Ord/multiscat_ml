@@ -5,7 +5,6 @@ import time
 from pathlib import Path
 from typing import Any, override
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from multiscat import OptimizationConfig
@@ -38,6 +37,8 @@ from slate_core.metadata._spaced import Domain  # ruff: ignore[import-private-na
 from slate_quantum import State, operator
 from torch import nn, optim
 from tqdm import tqdm
+
+from multiscat_ml.utils import plot_training_convergence, save_loss_history
 
 # Constants
 HELIUM_MASS = physical_constants["alpha particle mass"][0]
@@ -191,48 +192,6 @@ def simulate_target_state(
     return pack_complex(data)
 
 
-def intensity_map_from_actual(
-    actual: (Array[Any, np.dtype[np.complex128]]),
-    *,
-    threshold: float = 1e-8,
-) -> list[tuple[int, int, float]]:
-    """Convert scattering output into a sparse channel map of (kx, ky, intensity)."""
-    data = actual.raw_data.reshape(actual.basis.metadata().shape)
-
-    # Keep the FFT-style channel ordering used by multiscat plots.
-    # For odd N: 0..N//2,-N//2..-1. For even N: 0..N/2-1,-N/2..-1.
-    def _fft_channel_indices(size: int) -> list[int]:
-        half = size // 2
-        if size % 2 == 0:
-            return [*range(half), *range(-half, 0)]
-        return [*range(half + 1), *range(-half, 0)]
-
-    nx, ny = data.shape
-    kx_values = _fft_channel_indices(nx)
-    ky_values = _fft_channel_indices(ny)
-
-    rows: list[tuple[int, int, float]] = []
-    for i, kx in enumerate(kx_values):
-        for j, ky in enumerate(ky_values):
-            intensity = float(np.abs(data[i, j]))
-            if intensity > threshold:
-                rows.append((int(kx), int(ky), intensity))
-
-    return rows
-
-
-def format_intensity_map(
-    actual: (Array[Any, np.dtype[np.complex128]]),
-    *,
-    threshold: float = 1e-8,
-) -> str:
-    """Format scattering output as a text intensity map."""
-    rows = intensity_map_from_actual(actual, threshold=threshold)
-    lines = ["# kx ky intensity"]
-    lines.extend(f"{kx:4d} {ky:4d}  {intensity:.8e}" for kx, ky, intensity in rows)
-    return "\n".join(lines)
-
-
 class ResBlock(nn.Module):
     def __init__(self, hidden_dim: int, dropout_rate: float = 0.05) -> None:
         super().__init__()
@@ -265,7 +224,7 @@ class PureMLP(nn.Module):
     ) -> None:
         """Map the coordinates (n, m, z) to the wavefunction at the point for a pointwise flexible mapping.
 
-        Plain MLP is used for simplicity, but the model is currently laboured under severe spectral bias
+        Plain MLP is used for simplicity, but the model labours under severe spectral bias
         """
         super().__init__()
 
@@ -430,63 +389,6 @@ class ApplyLUFn(torch.autograd.Function):
             )
 
         return grad_pred, None, None, None, None
-
-
-def save_loss_history(loss_history: dict, path: str | Path) -> None:
-    path = Path(path)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(loss_history, f, indent=4)
-
-
-def plot_training_convergence(history: dict, save_path: Path) -> None:
-    """Generate a log-scale convergence plot."""
-    # Use a clean aesthetic style
-    plt.style.use(
-        "seaborn-v0_8-whitegrid"
-        if "seaborn-v0_8-whitegrid" in plt.style.available
-        else "default"
-    )
-
-    _fig, ax = plt.subplots(figsize=(8, 5), dpi=300)
-    epochs_range = range(1, len(history["train_loss"]) + 1)
-
-    # Plot training and validation tracks
-    ax.plot(
-        epochs_range,
-        history["train_loss"],
-        label="Training Loss",
-        color="#1f77b4",
-        linewidth=2,
-    )
-    ax.plot(
-        epochs_range,
-        history["val_loss"],
-        label="Validation Loss",
-        color="#ff7f0e",
-        linewidth=2,
-        linestyle="--",
-    )
-
-    # Crucial scientific step: Logarithmic scale for wide dynamic ranges
-    ax.set_yscale("log")
-
-    # Labels and metadata
-    ax.set_xlabel("Epochs", fontsize=12, fontweight="bold", labelpad=10)
-    ax.set_ylabel("Loss (Log Scale)", fontsize=12, fontweight="bold", labelpad=10)
-    ax.set_title(
-        "Model Convergence Profile",
-        fontsize=13,
-        fontweight="bold",
-        pad=15,
-    )
-
-    ax.legend(frameon=True, facecolor="white", edgecolor="none", fontsize=11)
-    ax.tick_params(axis="both", labelsize=10)
-
-    plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
-    plt.close()
-    print(f"--> Convergence plot saved to: {save_path}")
 
 
 def _sample_params_batch(rng: np.random.Generator, batch_size: int) -> np.ndarray:

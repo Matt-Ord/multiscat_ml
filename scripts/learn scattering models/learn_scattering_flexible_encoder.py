@@ -28,6 +28,8 @@ from torch import nn, optim
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
 from tqdm import tqdm
 
+from multiscat_ml.utils import plot_training_convergence, save_loss_history
+
 # Constants
 HELIUM_MASS = physical_constants["alpha particle mass"][0]
 HELIUM_ENERGY = 20 * electron_volt * 10**-3
@@ -148,7 +150,7 @@ def corrugated_morse_channels(  # ruff: ignore[too-many-arguments]
     beta: float,
     n_channels: int = potential_channels,
 ) -> torch.Tensor:
-    """Return (n_channels, n_channels, nz): [real, imag] stacked on axis 0."""
+    """Return the reciprocal potential in the shape (n_channels, n_channels, nz)."""
     z = torch.as_tensor(z, dtype=torch.float32)
 
     t = torch.exp(-(z - offset) / height)
@@ -176,7 +178,7 @@ def corrugated_morse_real_space(  # ruff: ignore[too-many-arguments]  # ruff: ig
     z: torch.Tensor | np.ndarray,
     a: float,
 ) -> torch.Tensor:
-    """Return (2, n_channels, n_channels, nz): [real, imag] stacked on axis 0."""
+    """Return the real space potential in the shape (n_channels, n_channels, nz)."""
     z = torch.as_tensor(z, device=DEVICE, dtype=torch.float32)
     x = torch.as_tensor(x, device=DEVICE, dtype=torch.float32)
     y = torch.as_tensor(y, device=DEVICE, dtype=torch.float32)
@@ -205,49 +207,13 @@ def get_potential(params: torch.Tensor | np.ndarray, z: torch.Tensor) -> torch.T
     )
 
 
-def intensity_map_from_actual(
-    actual: (Array[Any, np.dtype[np.complex128]]),
-    *,
-    threshold: float = 1e-8,
-) -> list[tuple[int, int, float]]:
-    """Convert scattering output into a sparse channel map of (kx, ky, intensity)."""
-    data = actual.raw_data.reshape(actual.basis.metadata().shape)
-
-    # Keep the FFT-style channel ordering used by multiscat plots.
-    # For odd N: 0..N//2,-N//2..-1. For even N: 0..N/2-1,-N/2..-1.
-    def _fft_channel_indices(size: int) -> list[int]:
-        half = size // 2
-        if size % 2 == 0:
-            return [*range(half), *range(-half, 0)]
-        return [*range(half + 1), *range(-half, 0)]
-
-    nx, ny = data.shape
-    kx_values = _fft_channel_indices(nx)
-    ky_values = _fft_channel_indices(ny)
-
-    rows: list[tuple[int, int, float]] = []
-    for i, kx in enumerate(kx_values):
-        for j, ky in enumerate(ky_values):
-            intensity = float(np.abs(data[i, j]))
-            if intensity > threshold:
-                rows.append((int(kx), int(ky), intensity))
-
-    return rows
-
-
-def format_intensity_map(
-    actual: (Array[Any, np.dtype[np.complex128]]),
-    *,
-    threshold: float = 1e-8,
-) -> str:
-    """Format scattering output as a text intensity map."""
-    rows = intensity_map_from_actual(actual, threshold=threshold)
-    lines = ["# kx ky intensity"]
-    lines.extend(f"{kx:4d} {ky:4d}  {intensity:.8e}" for kx, ky, intensity in rows)
-    return "\n".join(lines)
-
-
 class GlobalPotentialEncoder(nn.Module):
+    """
+    Learn the mapping from the potential coordinates (n, m, z) to a vector of size out_dim.
+
+    The out_dim depends on the complexity of the potential. This map is sued to build the encoder as the global features to be fed to the core model.
+    """
+
     def __init__(self, out_dim: int, coord_dim: int = 3) -> None:
         super().__init__()
         self.in_dim = coord_dim
@@ -287,11 +253,7 @@ class ResBlock(nn.Module):
 
 
 class ForwardModel(nn.Module):
-    """
-    Predict chi (one positive scalar per (n,m) point) from particle params.
-
-    The full real-valued reciprocal-space potential lattice.
-    """
+    """Predict S (one positive scalar per (n,m) point) from particle params and the local and the global features of the reciprocal-space potential lattice."""
 
     def __init__(  # ruff: ignore[too-many-positional-arguments]   # ruff: ignore[too-many-arguments]
         self,
@@ -341,6 +303,7 @@ class ForwardModel(nn.Module):
         local_potential: torch.Tensor,  # (B*N, Nz)
         global_feature: torch.Tensor,  # (B*N, encoder_dim)
     ) -> torch.Tensor:
+        # mix and align the inputs to match the shape of coords for a pointwise mapping
         x = self.embedding(
             torch.cat([params, coords, local_potential, global_feature], dim=-1)
         )
@@ -415,7 +378,9 @@ def predict_chi_batch_from_params(  # ruff: ignore[too-many-locals] # ruff: igno
         coords
     )  # (N_ch, Nz, D)  # ty: ignore[call-non-callable]
     weights = _trapezoid_weights(z_dev)  # (Nz,)
+    # contract the potential batch with the full tensor built from the learnt coordinate map
     global_feature = torch.einsum("nzd,bnz,z->bd", kernel, local, weights)  # (B, D)
+    # wrap the contracted result in a MLP for nonlinearity
     global_feature += forward_model.post(
         global_feature
     )  # (B, D)  # ty: ignore[call-non-callable]
@@ -534,59 +499,6 @@ def load_datasets() -> ConcatDataset[tuple[torch.Tensor, torch.Tensor]]:
     return ConcatDataset[tuple[torch.Tensor, torch.Tensor]](datasets)
 
 
-class FluxConservationLoss(nn.Module):
-    """Fixes the total sum of the scattering matrix (flux conservation/unitarity)."""
-
-    def __init__(self, reduction: str = "mean") -> None:
-        super().__init__()
-        self.reduction = reduction
-
-    @override
-    def forward(
-        self,
-        s_mat_pred: torch.Tensor,
-        s_mat_true: torch.Tensor,
-    ) -> torch.Tensor:
-        # Sum over the 15x15 grid (dimensions 1 and 2 for batch processing)
-        pred_sum = torch.sum(s_mat_pred, dim=(1, 2))
-        target_sum = torch.sum(s_mat_true, dim=(1, 2))
-
-        # Calculate the MSE between the predicted sums and the true sums
-        return torch.nn.functional.mse_loss(
-            pred_sum,
-            target_sum,
-            reduction=self.reduction,
-        )
-
-
-class TotalScatteringLoss(nn.Module):
-    """Combines standard data loss (MSE) with the physics-informed flux loss."""
-
-    def __init__(self, lambda_physics: float = 0.1) -> None:
-        super().__init__()
-        self.data_criterion = nn.MSELoss()
-        self.physics_criterion = FluxConservationLoss()
-        self.lambda_physics = lambda_physics
-
-    @override
-    def forward(
-        self,
-        s_mat_pred: torch.Tensor,
-        s_mat_true: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # 1. Standard pixel-wise MSE
-        loss_data = self.data_criterion(s_mat_pred, s_mat_true)
-
-        # 2. Physics sum penalty
-        loss_physics = self.physics_criterion(s_mat_pred, s_mat_true)
-
-        # 3. Combined total loss
-        loss_total = loss_data + (self.lambda_physics * loss_physics)
-
-        # Returning all three allows you to log them separately in your training loop
-        return loss_total, loss_data, loss_physics
-
-
 class SparseScatteringLoss(nn.Module):
     def __init__(
         self,
@@ -616,104 +528,6 @@ class SparseScatteringLoss(nn.Module):
         sparsity_loss = torch.mean(torch.abs(y_pred))
 
         return weighted_mse + (self.sparsity_weight * sparsity_loss)
-
-
-class SparseAndFluxScatteringLoss(nn.Module):
-    def __init__(
-        self,
-        peak_weight: float = 10.0,
-        sparsity_weight: float = 1e-4,
-        physics_weight: float = 5e-5,
-    ) -> None:
-        super().__init__()
-        self.peak_weight = peak_weight
-        self.sparsity_weight = sparsity_weight
-        self.mse = nn.MSELoss(reduction="none")  # Notice reduction='none'
-        self.physics_weights = physics_weight
-        self.physics = FluxConservationLoss()
-
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        # 1. Calculate the raw, un-averaged pixel-wise squared error
-        base_error = self.mse(y_pred, y_true)
-
-        # 2. Intensity Weighting
-        # Create a mask where empty channels equal 1.0, and bright channels > 1.0
-        # Example: If a peak has intensity 0.1 and weight is 100, its multiplier becomes 11.0
-        weight_mask = 1.0 + (self.peak_weight * y_true)
-
-        # Apply the weight and take the mean
-        weighted_mse = torch.mean(base_error * weight_mask)
-
-        # 3. Sparsity Penalty (L1)
-        # This constantly applies a tiny downward pressure on all predicted values,
-        # forcing the network to snap the background noise to exactly 0.0
-        sparsity_loss = torch.mean(torch.abs(y_pred))
-
-        # 4. Apply soft total flux criterion
-        flux_loss = self.physics(y_pred, y_true)
-
-        return (
-            weighted_mse
-            + (self.sparsity_weight * sparsity_loss)
-            + (self.peak_weight * flux_loss)
-        )
-
-
-def save_loss_history(loss_history: dict, path: str | Path) -> None:
-    path = Path(path)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(loss_history, f, indent=4)
-
-
-def plot_training_convergence(history: dict, save_path: Path) -> None:
-    """Generate a publication-grade log-scale convergence plot."""
-    # Use a clean aesthetic style
-    plt.style.use(
-        "seaborn-v0_8-whitegrid"
-        if "seaborn-v0_8-whitegrid" in plt.style.available
-        else "default"
-    )
-
-    _fig, ax = plt.subplots(figsize=(8, 5), dpi=300)
-    epochs_range = range(1, len(history["train_loss"]) + 1)
-
-    # Plot training and validation tracks
-    ax.plot(
-        epochs_range,
-        history["train_loss"],
-        label="Training Loss",
-        color="#1f77b4",
-        linewidth=2,
-    )
-    ax.plot(
-        epochs_range,
-        history["val_loss"],
-        label="Validation Loss",
-        color="#ff7f0e",
-        linewidth=2,
-        linestyle="--",
-    )
-
-    # Crucial scientific step: Logarithmic scale for wide dynamic ranges
-    ax.set_yscale("log")
-
-    # Labels and metadata
-    ax.set_xlabel("Epochs", fontsize=12, fontweight="bold", labelpad=10)
-    ax.set_ylabel("Loss (Log Scale)", fontsize=12, fontweight="bold", labelpad=10)
-    ax.set_title(
-        "Model Convergence Profile Across Real Position Space",
-        fontsize=13,
-        fontweight="bold",
-        pad=15,
-    )
-
-    ax.legend(frameon=True, facecolor="white", edgecolor="none", fontsize=11)
-    ax.tick_params(axis="both", labelsize=10)
-
-    plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
-    plt.close()
-    print(f"--> Convergence plot saved to: {save_path}")
 
 
 def train() -> None:  # noqa: PLR0914   # ruff: ignore[too-many-statements]
