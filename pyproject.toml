@@ -8,7 +8,7 @@ dependencies = [
     "h5py>=3.16.0",
     "matplotlib>=3.10.8",
     "multiscat",
-    "torch>=2.12.0,<3.0.0",
+    "torch>=2.5.0,<3.0.0",
 ]
 
 [dependency-groups]
@@ -20,6 +20,10 @@ dev = [
     "ty>=0.0.50",
 ]
 
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
 
 [tool.ruff]
 unsafe-fixes = true
@@ -82,7 +86,8 @@ reportUnknownMemberType = false
 include = ["multiscat_ml", "multiscat_ml.*"]
 
 [tool.uv.sources]
-multiscat = { git = "https://github.com/Matt-Ord/multiscat.git" }
+multiscat = { git = "https://github.com/Matt-Ord/multiscat.git", rev="fa83fd70f95f3c2750f5097cbe1dcca6dc1b9356" }
+torch = { index = "pytorch-cu126" }
 
 
 [build-system]
