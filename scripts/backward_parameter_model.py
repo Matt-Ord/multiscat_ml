@@ -38,8 +38,8 @@ elif torch.backends.mps.is_available():
 else:
     DEVICE = torch.device("cpu")  # pyright: ignore[reportConstantRedefinition]
 
-PARAMS_MIN = np.array([15.0, 0.5, 0.05, 2.5, 0.0], dtype=np.float64)
-PARAMS_MAX = np.array([20.0, 1.2, 0.20, 4.0, 2 * np.pi / 5], dtype=np.float64)
+PARAMS_MIN = np.array([5.0, 0.5, 0.05, 2.5, 0.0], dtype=np.float64)
+PARAMS_MAX = np.array([15.0, 1.2, 0.20, 4.0, 2 * np.pi / 5], dtype=np.float64)
 OFFSET = 1.0
 Nx, Ny, Nz = 11, 11, 100
 potential_channels = 11
@@ -707,7 +707,7 @@ def test(  # ruff: ignore[too-many-arguments]  # ruff: ignore[too-many-locals]
 
 
 if __name__ == "__main__":
-    RUN_GENERATE = True
+    RUN_GENERATE = False
     RUN_TRAIN = False
     RUN_TEST = False
 
