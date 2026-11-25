@@ -9,7 +9,7 @@ from multiscat.basis import (
     scattering_metadata_from_stacked_delta_x,
     split_scattering_metadata,
 )
-from multiscat.config import MorseScatteringCondition, momentum_from_angles
+from multiscat.config import MorseScatteringCondition, incident_k_from_angles
 from multiscat.multiscat import get_scattering_state
 from scipy.constants import angstrom as angstrom_si  # type: ignore[import-untyped]
 from scipy.constants import (  # type: ignore[import-untyped]
@@ -75,7 +75,7 @@ def condition_from_params(
         mass=mass * atomic_mass,
         morse_parameters=morse_params,
         metadata=metadata,
-        incident_k=momentum_from_angles(
+        incident_k=incident_k_from_angles(
             theta=theta,
             phi=phi,
             energy=energy * electron_volt * 10**-3,
